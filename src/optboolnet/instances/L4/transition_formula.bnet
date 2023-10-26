@@ -1,0 +1,76 @@
+AKT, (PDK1 | mTORC2)
+ASK1, !AKT 
+Antisurvival, FOXO & Caspase9 & Caspase8 
+Axin, !LRP 
+BAD, !AKT & !RSK 
+BAX, p53 
+BCL2, !BAD 
+CFLAR, AKT & !ITCH 
+CK1, !LRP 
+Caspase8, !CFLAR 
+Caspase9, CytochromeC 
+CytochromeC, BAX & !BCL2 
+DKK1, DKK1gene 
+DKK1gene, TCF & !cMYC 
+DUSP1, (p38alpha | MSK)
+DUSP6, (ERK | mTORC1)
+Dvl, Fz 
+ERK, (MEK | !DUSP6)
+Egr1, !TCF 
+FOXO, !AKT & !NLK 
+Fz, !SFRP1 
+GAB, !ERK & GRB2 
+GRAP2, !p38alpha 
+GRB2, SHC1 
+GSK3, !p38alpha & !AKT & !LRP & !RSK & !ERK & !S6K & !Dvl 
+IKKA, AKT 
+IKKB, !p53 & TAK1 
+IRS1, !IKKB & !ERK & !S6K 
+ITCH, JNK1 
+JNK1, !DUSP1 &  (MKK7 | MKK4)
+LEF, betacatenin 
+LRP, !DKK1 &  (p38alpha | ERK | Fz | JNK1)
+MAP3K8, IKKB 
+MDM2, !S6K &  (AKT | MDM2gene)
+MDM2gene, (p53 | NFkB)
+MEK, (!ERK | Raf | MAP3K8)
+MEKK4, Rac 
+MKK3, (ASK1 | TAK1)
+MKK4, (MEKK4 | TAK1 | GRAP2 | MLK3)
+MKK7, (TAK1 | GRAP2)
+MLK3, Rac 
+MMP, LEF 
+MSK, (p38alpha | ERK)
+NFkB, (IKKA | IKKB | MSK)
+NLK, TAK1 
+PDK1, PI3K & !PTEN 
+PI3K, (GAB | Ras | IRS1)
+PTEN, !GSK3 & PTENgene 
+PTENgene, Egr1 
+Prosurvival, TCF & cMYC & RSK
+RSK, ERK & PDK1 
+RTPK, !p38alpha & !MEK &  (RTPKgene | MMP)
+RTPKgene, FOXO 
+Rac, (mTORC2 | Dvl)
+Raf, (!AKT | Ras) & (!ERK | Ras) & (Ras | !Rheb)
+Ras, (SHP2 | SOS)
+Rheb, !TSC2 
+S6K, (PDK1 | mTORC1)
+SFRP1, SFRP1gene 
+SFRP1gene, !cMYC 
+SHC1, (!PTEN | RTPK)
+SHP2, GAB 
+SOS, (!ERK | GRB2)
+TAB1, !p38alpha 
+TAK1, TAB1 
+TCF, (betacatenin | !NLK)
+TSC2, !AKT & GSK3 & !IKKB & !RSK & !ERK 
+betaTrCP, Axin & GSK3 & CK1 
+betacatenin, (IKKA | !betaTrCP)
+cMYC, TCF 
+mTORC1, !pras40 &  (RSK | Rheb)
+mTORC2, TSC2 & !S6K 
+p, Antisurvival & !Prosurvival
+p38alpha, !DUSP1 &  (MKK3 | MKK4)
+p53, p38alpha & !MDM2 
+pras40, !AKT 

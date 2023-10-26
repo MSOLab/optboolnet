@@ -1,0 +1,46 @@
+{% set data = load_setup_py_data(setup_file='../setup.py', from_recipe_dir=True) %}
+{% set name = data.get('name') %}
+{% set version = data.get('version')  %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ../
+
+build:
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  number: 0
+
+requirements:
+  host:
+    - python
+    - pip
+  run:
+    - python
+    - boolean.py
+    - colomoto_jupyter # [noarch]
+    - pyomo # [noarch]
+    - gurobi
+
+test:
+  files:
+    - run_test.bat
+  requires:
+    - pip
+    - pytest
+  source_files:
+    - ./tests/*.py
+    - ./tests/*/*
+
+about:
+  home: https://www.msolab.org/
+  summary: The optimization toolbox for control problems of a Boolean network
+  license: MIT
+  license_file: LICENSE.txt
+
+extra:
+  recipe-maintainers:
+    - kalebmoon07

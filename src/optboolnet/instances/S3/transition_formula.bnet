@@ -1,0 +1,19 @@
+AKT, (BDNF | ALK) & (TrkB | MDK) & (TrkB | ALK) & (BDNF | MDK)
+ALK, ALK 
+Angiogenesis, AKT 
+Apoptosis, (!NGF | p53) & (TrkA | !AKT) & (!NGF | !AKT) & (TrkA | p53)
+BDNF, BDNF 
+Differentiation, (ALK | Ras) & (MDK | Ras)
+FOXO, !AKT 
+IP3, TrkB & BDNF 
+MDK, MDK 
+MDM2, p53 
+MYCN, !TrkA &  (Ras | AKT)
+NGF, NGF 
+Proliferation, (!p53 | IP3) & (!p27 | IP3)
+Ras, TrkA & NGF 
+TrkA, !MYCN 
+TrkB, TrkB 
+p, Proliferation & !Apoptosis & !Differentiation & Angiogenesis
+p27, (!MYCN | FOXO)
+p53, p53 

@@ -1,0 +1,23 @@
+{
+    "__name__": "control",
+    "controllable_vars": [
+        "EGFR",
+        "ERK1_2",
+        "PI3K",
+        "AKT",
+        "GSK3B",
+        "MDM2",
+        "TP53",
+        "PTEN",
+        "PARP1",
+        "BRCA1",
+        "BCL_2"
+    ],
+    "uncontrollable_vars": [
+        "BAX",
+        "CYCD1",
+        "p"
+    ],
+    "fixed_values": {},
+    "phenotype": "p"
+}

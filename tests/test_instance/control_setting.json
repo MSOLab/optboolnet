@@ -1,0 +1,12 @@
+{
+    "__name__": "control",
+    "controllable_vars": [
+        "x1"
+    ],
+    "uncontrollable_vars": [
+        "x2",
+        "x3"
+    ],
+    "fixed_values": {},
+    "phenotype": null
+}

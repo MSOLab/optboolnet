@@ -1,0 +1,43 @@
+{
+    "__name__": "benders",
+    "enforce": true,
+    "max_control_size": 3,
+    "max_length": 15,
+    "allow_empty_attractor": false,
+    "solve_separation": true,
+    "preprocess_max_forbidden_trap_space": true,
+    "separation_heuristic": true,
+    "use_high_point_relaxation": false,
+    "master_solver_config": {
+        "__name__": "solver",
+        "solver_name": "gurobi_persistent",
+        "save_results": false,
+        "tee": false,
+        "threads": 1,
+        "warmstart": false,
+        "time_limit": null
+    },
+    "LLP_solver_config": {
+        "__name__": "solver",
+        "solver_name": "gurobi_persistent",
+        "save_results": false,
+        "tee": false,
+        "threads": 1,
+        "warmstart": false,
+        "time_limit": null
+    },
+    "separation_solver_config": {
+        "__name__": "solver",
+        "solver_name": "gurobi_persistent",
+        "save_results": false,
+        "tee": false,
+        "threads": 1,
+        "warmstart": false,
+        "time_limit": null
+    },
+    "logging_config": {
+        "__name__": "logging",
+        "to_stream": false,
+        "fpath": ""
+    }
+}

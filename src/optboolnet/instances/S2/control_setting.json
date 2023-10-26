@@ -1,0 +1,27 @@
+{
+    "__name__": "control",
+    "controllable_vars": [
+        "MYC",
+        "RAS",
+        "FOXO",
+        "AKT",
+        "P27",
+        "Cyc_Cdk",
+        "P53",
+        "BAD",
+        "MDM2",
+        "BAX",
+        "PTEN",
+        "OverPop",
+        "Hypoxia",
+        "GrowthFactor",
+        "DNA_Damage"
+    ],
+    "uncontrollable_vars": [
+        "Prolif",
+        "Apop",
+        "p"
+    ],
+    "fixed_values": {},
+    "phenotype": "p"
+}
