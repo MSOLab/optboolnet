@@ -16,4 +16,4 @@ python -m pip install -U colomoto-docker
 colomoto-docker --image mso_lab/colomoto-optboolnet -V v0 --bind .
 ```
 
-Note: `gurobi.lic` must be in the working directoy.
+Note: A Gurobi [Web License Service](https://license.gurobi.com/manager/doc/overview/) (WLS) `gurobi.lic` must be in the working directoy.
