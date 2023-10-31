@@ -21,8 +21,8 @@ requirements:
   run:
     - python
     - boolean.py
-    - colomoto_jupyter # [noarch]
-    - pyomo # [noarch]
+    - colomoto_jupyter
+    - pyomo
     - gurobi
 
 test:
