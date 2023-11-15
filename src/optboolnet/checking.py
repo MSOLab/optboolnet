@@ -7,9 +7,10 @@ def _nusmv_var(n):
     if isinstance(n, int):
         return "x%d" % n
     return n
-def _nusmv_model(bn, update_mode="synchronous"):
+def _nusmv_model(bn, control=None, update_mode="synchronous"):
     """
     bn: minibn.CNFBooleanNetwork
+    control: Control
     update_mode: synchronous, asynchronous
     """
 
@@ -29,7 +30,12 @@ def _nusmv_model(bn, update_mode="synchronous"):
             lines.append("next(%s) := {%s, f%s};" % (var(i),var(i),i))
 
     lines.append("DEFINE")
+    if control is None:
+        control = {}
     for n in bn.vars_list:
+        if n in control:
+            lines.append(f"f{n} := {'TRUE' if control[n] else 'FALSE'};")
+            continue
         clauses = bn.items_clause(n)
         if not clauses:
             lines.append(f"f{n} := FALSE;")
@@ -80,33 +86,36 @@ def _nusmv_alltrue(nusmv_input, smvfile):
         if tmp_smvfile:
             os.unlink(smvfile)
 
-def nusmv_check_attractor(bn, attractor, update_mode="synchronous",
+def nusmv_check_attractor(bn, attractor, control=None,
+                update_mode="synchronous",
                 smvfile=None):
     """
     Returns true if attractor is indeed an attractor of the bn
 
     bn: CNFBooleanNetwork
     attractor: Attractor
+    control: Control
     update_mode: synchronous, asynchronous, general
-    smvfile: if None makes a temporary file to be deleted after call
+    smvfile: if None use a temporary file
     """
     dstate = dict(zip(sorted(bn.vars_list), attractor.value_list[0]))
     dstate_smv = _nusmv_state(dstate)
-    nusmv_input = _nusmv_model(bn, update_mode=update_mode)
+    nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
     nusmv_input += f"INIT {dstate_smv};\n"
     nusmv_input += f"CTLSPEC AG EF ({dstate_smv});"
     return _nusmv_alltrue(nusmv_input, smvfile)
 
 
-def nusmv_check_phenotype(bn, update_mode="synchronous",
+def nusmv_check_phenotype(bn, control=None, update_mode="synchronous",
                 smvfile=None):
     """
     Returns true if all the attractors have p=1 constantly
 
     bn: CNFBooleanNetwork
+    control: Control
     update_mode: synchronous, asynchronous, general
-    smvfile: if None makes a temporary file to be deleted after call
+    smvfile: if None, uses a temporary file
     """
-    nusmv_input = _nusmv_model(bn, update_mode=update_mode)
+    nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
     nusmv_input += f"CTLSPEC EF AG {bn.phenotype};"
     return _nusmv_alltrue(nusmv_input, smvfile)

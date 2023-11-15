@@ -23,6 +23,8 @@ def test_nusmv_check_attractor():
 def test_nusmv_check_phenotype():
     bn = load_bn_in_repo("S1")
     assert not checking.nusmv_check_phenotype(bn)
+    assert not checking.nusmv_check_phenotype(bn, control={"EGF": 0})
+    assert checking.nusmv_check_phenotype(bn, control={"EGF": 0, "ER_a": 0})
 
 if __name__ == "__main__":
     test_nusmv_check_attractor()
