@@ -108,5 +108,5 @@ def nusmv_check_phenotype(bn, update_mode="synchronous",
     smvfile: if None makes a temporary file to be deleted after call
     """
     nusmv_input = _nusmv_model(bn, update_mode=update_mode)
-    nusmv_input += f"CTLSPEC AG EF {bn.phenotype};"
+    nusmv_input += f"CTLSPEC AG EF AG {bn.phenotype};"
     return _nusmv_alltrue(nusmv_input, smvfile)
