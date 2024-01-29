@@ -431,7 +431,7 @@ class AttractorDetectionIP(MasterControlIP):
             self.add_constr_to_list(
                 sum(
                     x_i_1 if value == 0 else (1 - x_i_1)
-                    for x_i_1, value in zip(self.x[:, 0], x_del)
+                    for x_i_1, value in zip(self.x[:, 1], x_del)
                 )
                 >= 1,
                 self.constrs_no_good_x,
