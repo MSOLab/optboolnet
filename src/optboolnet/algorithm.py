@@ -1,7 +1,8 @@
 import time
-from typing import Dict, List, Callable, Optional, Union
+from typing import Dict, List, Callable, Optional
 from optboolnet import CNFBooleanNetwork, Control
 from optboolnet.boolnet import Attractor
+from optboolnet.exception import InvalidConfigError
 from optboolnet.model import (
     Model,
     CoreIP,
@@ -10,18 +11,12 @@ from optboolnet.model import (
     MasterControlIP,
     TrapSpaceDetectionIP,
 )
-from optboolnet.config import (
-    AttractorControlConfig,
-    BendersConfig,
-    LoggingConfig,
-    SolverConfig,
-)
+from optboolnet.config import LoggingConfig, SolverConfig
+from algorecell_types import ReprogrammingStrategies, FromCondition
 from optboolnet.log import EnumBendersStep, BendersLogger
 
 
 class AttractorControl:
-    _config: AttractorControlConfig
-
     def __init__(
         self, name: str, bn: CNFBooleanNetwork, logging_config: LoggingConfig
     ) -> None:
@@ -32,6 +27,14 @@ class AttractorControl:
         self.solution_dict: Dict[int, List[Control]] = dict()
         """(key) core size (value) list of minimal controls"""
         self.start_time = time.time()
+        self.total_time_limit = None
+        self.max_control_size = 0
+        """The upper limit to the size of controls"""
+        self.max_length = 1
+        """The upper limit of the length of attractors to discover"""
+        self.allow_empty_attractor: bool = True
+        """If true, a no good cut removes the controls that induces no attractor
+        Otherwise, an Exception is raised"""
         self.logger = BendersLogger(logging_config)
 
     @property
@@ -46,24 +49,24 @@ class AttractorControl:
 
     @property
     def is_timeout(self) -> bool:
-        if self._config.total_time_limit is None:
+        if self.total_time_limit is None:
             return False
         else:
-            return self.elapsed_time > self._config.total_time_limit
+            return self.elapsed_time > self.total_time_limit
 
     @property
     def remaining_time(self) -> Optional[float]:
-        if self._config.total_time_limit == None:
+        if self.total_time_limit == None:
             return None
         else:
-            return self._config.total_time_limit - self.elapsed_time
+            return self.total_time_limit - self.elapsed_time
 
-    def iter_target_size(self):
-        for target_size in range(self._config.max_control_size + 1):
+    def iter_target_size(self, max_control_size: int):
+        for target_size in range(max_control_size + 1):
             yield target_size
 
     @BendersLogger.wrap_model_build
-    def build_model(self, cls: type[Model], *args):
+    def _build_model(self, cls: type[Model], *args):
         return cls(*args)
 
     @BendersLogger.wrap_model_optimize
@@ -82,7 +85,7 @@ class AttractorControl:
             default=None,
         )
         # update_options_time_limit
-        if (_time_limit != None):
+        if _time_limit != None:
             if (_time_limit != None) and (_time_limit < 0):
                 return False
             else:
@@ -98,53 +101,92 @@ class AttractorControl:
         """
         return func(*args)
 
+    @property
+    def solution_count(self) -> int:
+        return sum(len(_sol_list) for _sol_list in self.solution_dict.values())
+
 
 class BendersAttractorControl(AttractorControl):
     def __init__(
         self,
         name: str,
         bn: CNFBooleanNetwork,
-        _config: Union[str, dict, BendersConfig],
+        logging_config: LoggingConfig = LoggingConfig(),
     ) -> None:
-        super().__init__(name, bn, _config.logging_config)
-        self._config: BendersConfig = BendersConfig.instantiate(_config)
+        super().__init__(name, bn, logging_config)
+        self.solve_separation: bool = False
+        """If true, a separation problem is solved to boost the performance.
+        Only valid when the max_length is sufficiently large so that every attractor can be found
+        by one of the lower level problems."""
+        self.preprocess_max_forbidden_trap_space: bool = False
+        """If true, all maximal forbidden trap spaces are found and add the cuts removing them.
+        This can boost performance if max_control_size is sufficiently large"""
+        self.separation_heuristic: bool = False
+        """If true, many variables in the separation problem are fixed. 
+        This may slightly reduce the computation time for separation problems.
+        However, the separation may fail or the resulting constraints may be weak."""
+        self.use_high_point_relaxation: bool = False
+        """Use the high point relaxation for the master problem.
+        Only valid if the max_length is 1"""
 
-        if self._config.use_high_point_relaxation:
-            self.model_master = self.build_model(
-                AttractorDetectionIP,
-                "0",
-                self.bn,
-                1,
-                self._config.master_solver_config,
+    def validate_config(self):
+        if (self.max_length != 1) and self.use_high_point_relaxation:
+            raise InvalidConfigError(
+                "The high point relaxation can be only used for is when the length of attractor is 1"
+            )
+        if (not self.solve_separation) and (
+            self.preprocess_max_forbidden_trap_space or self.separation_heuristic
+        ):
+            raise InvalidConfigError(
+                "preprocess_max_forbidden_trap_space and separation_heuristic can be used only when solve_separation is on"
+            )
+
+    def iter_exhaustive_search(
+        self,
+        max_control_size: int,
+        max_length: int,
+        master_solver_config: SolverConfig = SolverConfig(),
+        LLP_solver_config: SolverConfig = SolverConfig(),
+        separation_solver_config: SolverConfig = SolverConfig(),
+        **kwargs,
+    ):
+        """Finds all minimal controls that induces the given phenotype at all states of every attractor
+
+        Returns:
+            _type_: _description_
+        """
+        self.max_control_size = max_control_size
+        self.max_length = max_length
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        self.validate_config()
+        # model building
+        if self.use_high_point_relaxation:
+            self.model_master = self._build_model(
+                AttractorDetectionIP, "0", self.bn, 1, master_solver_config
             )
             self.model_master.make_constr_phenotype_at_all_t()
             self.model_master.fix_phenotype(1)
         else:
-            self.model_master = self.build_model(
-                MasterControlIP,
-                "0",
-                self.bn,
-                self._config.master_solver_config,
+            self.model_master = self._build_model(
+                MasterControlIP, "0", self.bn, master_solver_config
             )
-        if self._config.solve_separation:
-            self.model_separation = self.build_model(
-                TrapSpaceDetectionIP,
-                f"0",
-                self.bn,
-                self._config.separation_solver_config,
+        if self.solve_separation:
+            self.model_separation = self._build_model(
+                TrapSpaceDetectionIP, f"0", self.bn, separation_solver_config
             )
             self.model_separation.fix_phenotype(0)
             self.model_separation.set_objective_sparse_cut()
         else:
             self.model_separation = None
         self.model_LLP_list: List[ExtendedAttractorDetectionIP] = list()
-        for length in range(1, self._config.max_length + 1):
-            model_LLP = self.build_model(
+        for length in range(1, self.max_length + 1):
+            model_LLP = self._build_model(
                 ExtendedAttractorDetectionIP,
                 f"{length}",
                 self.bn,
                 length,
-                self._config.LLP_solver_config,
+                LLP_solver_config,
             )
             model_LLP.fix_var(model_LLP.v, 0)
             model_LLP.make_constr_stability_condition()
@@ -152,18 +194,11 @@ class BendersAttractorControl(AttractorControl):
             model_LLP.set_phenotype_obj()
             self.model_LLP_list.append(model_LLP)
 
-    def run_exhaustive_search(self):
-        """Finds all minimal controls that induces the given phenotype at all states of every attractor
-
-        Returns:
-            _type_: _description_
-        """
-        # TODO: merge with a new parent class
         # preprocessing
-        if self._config.preprocess_max_forbidden_trap_space:
+        if self.preprocess_max_forbidden_trap_space:
             self.add_all_max_forbidden_trap_space_cuts()
         # main step
-        for self.target_size in self.iter_target_size():
+        for self.target_size in self.iter_target_size(max_control_size):
             _solution_list = list()
             self.model_master.set_constr_target_size(self.target_size)
             while not self.is_timeout and self.find_candidate():
@@ -171,6 +206,7 @@ class BendersAttractorControl(AttractorControl):
                 if not self.is_separation_violated(ctrl) and not self.is_LLP_violated(
                     ctrl
                 ):
+                    yield ctrl
                     _solution_list.append(ctrl)
                     self._append_cut(self.model_master.append_minimality_cut, ctrl)
             self.solution_dict[self.target_size] = _solution_list
@@ -179,7 +215,14 @@ class BendersAttractorControl(AttractorControl):
             self.step = EnumBendersStep.FINISHED
             self.logger.solve_logger_info(self.log_signature)
         self.logger.write_controls_to_json(self.solution_dict)
-        return self.solution_dict
+        # return self.solution_dict
+
+    def get_control_strategies(self, max_control_size: int, max_length: int, **kwargs):
+        strategies = ReprogrammingStrategies()
+        strategies.register_alias("input", self.bn.fixed_values)
+        for ctrl in self.iter_exhaustive_search(max_control_size, max_length, **kwargs):
+            strategies.add(FromCondition("input", ctrl))
+        return strategies
 
     def find_candidate(self) -> bool:
         """Solves the master problem to find a solution candidate
@@ -200,12 +243,12 @@ class BendersAttractorControl(AttractorControl):
             bool: whether a forbidden trap space is found
         """
 
-        if not self._config.solve_separation:
+        if not self.solve_separation:
             return False
         self.step = EnumBendersStep.SEPARATION_PROBLEM
 
         # applying the heuristic may save the time but weaken the cut
-        if self._config.separation_heuristic:
+        if self.separation_heuristic:
             self.model_separation.fix_control(ctrl)
         else:
             self.model_separation.add_constr_separation(ctrl)
@@ -243,7 +286,7 @@ class BendersAttractorControl(AttractorControl):
                     attr = LLP_model.get_attractor()
                     self._append_cut(self.model_master.append_logical_benders_cut, attr)
                     return True
-        if is_feasible or self._config.allow_empty_attractor:
+        if is_feasible or self.allow_empty_attractor:
             return False
         else:
             self._append_cut(self.model_master.append_no_good_cut_d, ctrl)
@@ -251,7 +294,7 @@ class BendersAttractorControl(AttractorControl):
 
     def add_all_max_forbidden_trap_space_cuts(self):
         """Preprocess maximal forbidden trap spaces and add cuts to the master problem"""
-        if not self._config.solve_separation:
+        if not self.solve_separation:
             return
         self.step = EnumBendersStep.FORBIDDEN_TRAP_SPACE_CUT
         self.model_separation.set_constr_target_size(0)
@@ -265,27 +308,31 @@ class BendersAttractorControl(AttractorControl):
         self.model_separation.set_constr_target_size(None)
         self.model_separation.clear_constr_list(self.model_separation.constrs_benders)
 
-    @property
-    def solution_count(self) -> int:
-        return sum(len(_sol_list) for _sol_list in self.solution_dict.values())
-
 
 class BendersFixPointControl(BendersAttractorControl):
-    _config: BendersConfig
+    def validate_config(self):
+        super().validate_config()
+        _message = """The following settings for the fixed point control problem are enforced:
+                \t self.max_length == 1
+                \t self.preprocess_max_forbidden_trap_space == False
+                \t self.solve_separation == False
+                \t self.separation_heuristic == False
+                """
 
-    def __init__(
-        self, name: str, bn: CNFBooleanNetwork, _config: BendersConfig
-    ) -> None:
-        _config = BendersConfig.instantiate(_config)
-        _config.check_fixed_point_configs()
-        super().__init__(name, bn, _config)
+        if not (
+            (self.max_length == 1)
+            and (self.preprocess_max_forbidden_trap_space == False)
+            and (self.solve_separation == False)
+            and (self.separation_heuristic == False)
+        ):
+            raise InvalidConfigError(_message)
 
 
 def enumerate_attractors(
     bn: CNFBooleanNetwork,
     max_length: int,
     ctrl: Control,
-    solver_config: SolverConfig,
+    solver_config: SolverConfig = SolverConfig(),
 ):
     attractor_list: List[Attractor] = list()
     for length in range(1, 1 + max_length):

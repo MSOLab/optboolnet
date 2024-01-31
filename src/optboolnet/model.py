@@ -214,14 +214,14 @@ class MasterControlIP(CoreIP):
             )
 
     def get_control(self) -> Control:
-        ctrl = Control()
+        ctrl_dict = dict()
         for j in self.J:
             if pmoenv.value(self.d[j, 0]) == 1:
-                ctrl[j] = Control.ZERO
+                ctrl_dict[j] = 0
             elif pmoenv.value(self.d[j, 1]) == 1:
-                ctrl[j] = Control.ONE
+                ctrl_dict[j] = 1
             # else: ctrl[j] = Hypercube.FREE
-        return ctrl
+        return Control(ctrl_dict)
 
     def fix_control(self, ctrl: Control):
         """Fix the control d as the given object
@@ -647,10 +647,9 @@ class TrapSpaceDetectionIP(MasterControlIP):
         trap_space = Hypercube()
         for i in self.I:
             if self.h[i, 0].value == 1:
-                trap_space[i] = Hypercube.ZERO
+                trap_space[i] = 0
             elif self.h[i, 1].value == 1:
-                trap_space[i] = Hypercube.ONE
-            # else: trap_space[i] = Hypercube.FREE
+                trap_space[i] = 1
         return trap_space
 
     def add_trap_space_maximality_cut(self, ctrl: Control, trap_space: Hypercube):

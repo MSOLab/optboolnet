@@ -1,6 +1,5 @@
 import pytest
-import os, json
-import optboolnet as optbn
+import os
 from optboolnet.instances import load_bn, load_bn_in_repo, iter_bn_in_repo
 from optboolnet.boolnet import Hypercube
 

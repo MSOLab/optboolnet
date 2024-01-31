@@ -32,7 +32,7 @@ def test_attractor_dection():
         bn = load_bn_in_repo(inst)
         print("Check attractors with both phenotypes exist", inst)
         attr_ip = AttractorDetectionIP(
-            "test_attractor_enumeration", bn, 5, SolverConfig(_solver_config)
+            "test_attractor_enumeration", bn, 5, SolverConfig(**_solver_config)
         )
         attr_ip.make_constr_stability_condition()
         attr_ip.make_constr_phenotype_at_all_t()

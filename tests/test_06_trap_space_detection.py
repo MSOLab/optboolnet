@@ -13,7 +13,7 @@ os.dup2(sys.stdout.fileno(), stdout_copy)
 sys.stdout = os.fdopen(stdout_copy, "w")
 
 _config = SolverConfig(
-    {
+    **{
         "solver_name": "gurobi_persistent",
         "save_results": False,
         "tee": False,

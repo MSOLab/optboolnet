@@ -1,10 +1,11 @@
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple
 import boolean
-from colomoto.minibn import _TRUE, _FALSE, NOT
+from colomoto.minibn import _TRUE, _FALSE
 from colomoto import minibn
 from colomoto.types import Hypercube as _Hypercube
 
 from optboolnet.config import ControlConfig
+from algorecell_types import PermanentPerturbation
 
 
 class ORClause(boolean.Expression):
@@ -41,24 +42,32 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
     def __init__(
         self,
         data,
-        control_config: Union[str, dict, ControlConfig],
+        control_config: ControlConfig,
         Symbol_class=boolean.Symbol,
         allowed_in_name=(".", "_", ":", "-"),
         **kwargs,
     ):
-        super().__init__(data, Symbol_class, allowed_in_name, **kwargs)
+        super().__init__(data, Symbol_class, allowed_in_name)
 
-        _control_config = ControlConfig.instantiate(control_config)
+        _control_config = control_config
         self._control_config = _control_config
-        self.controllable_vars = _control_config.controllable_vars
-        self.uncontrollable_vars = _control_config.uncontrollable_vars
         self.vars_list = list(self.keys())
+        self.controllable_vars = [
+            var for var in _control_config.controllable_vars if var in self.vars_list
+        ]
+        self.uncontrollable_vars = [
+            var for var in _control_config.uncontrollable_vars if var in self.vars_list
+        ]
+
         self.fixed_values = _control_config.fixed_values
         self.phenotype = _control_config.phenotype
 
+        if (self.phenotype not in self) and ("phenotype_formula" in kwargs):
+            self[self.phenotype] = kwargs.pop("phenotype_formula")
+        for var_name, value in self.fixed_values.items():
+            self[var_name] = value
         # TODO: assert when this formula is not a CNF
         # TODO: convert to CNF if needed
-        # TODO: fix variables
         # TODO: check if union of controllable/uncontrollable vars covers the whole vars
         # TODO: check if control is applied twice
 
@@ -152,13 +161,17 @@ class Attractor:
 
 
 class Hypercube(_Hypercube):
-    ONE = 1
-    ZERO = 0
-    FREE = "*"  # assume unfixed variables do not have keys
-
     def unfixed_vars(self, vars_list: List[str]):
         return set(vars_list) - self.keys()
 
 
-class Control(Hypercube):
-    pass
+class Control(Hypercube, PermanentPerturbation):
+    def __init__(self, *args, **kwargs):
+        super(Hypercube, self).__init__(*args, **kwargs)
+        super(PermanentPerturbation, self).__init__(*args, **kwargs)
+
+    def __hash__(self) -> int:
+        return super(PermanentPerturbation).__hash__()
+
+    def unfixed_vars(self, vars_list: List[str]):
+        return super().unfixed_vars(vars_list)

@@ -1,6 +1,9 @@
-from typing import Any, Dict, List, Optional, TypeVar, Union
-from optboolnet.exception import InvalidConfigError, InvalidConfigWarning
-import json, warnings
+from __future__ import annotations
+from typing import Dict, Generic, List, Optional, TypeVar
+import json
+
+_DEFAULT_SOLVER = "gurobi_persistent"
+_C = TypeVar("_C", bound="AttractorControlConfig")
 
 
 class Config:
@@ -8,21 +11,15 @@ class Config:
     By default, an instance is constructed from a dict object.
     One can be also instantiated by the class method instantiate"""
 
-    subclasses = []
+    subclasses: list[type[Config]] = []
 
     __hidden__: List[str] = list()
     enforce: bool = True
-    """If true, any incosistent values will be fixed as the developer's default values"""
+    """If true, any inconsistent values will be fixed as the developer's default values"""
 
-    def __init__(self, data: Dict) -> None:
-        for _key, _value in data.items():
-            if isinstance(_value, dict) and "__name__" in _value:
-                for _cls in Config.subclasses:
-                    if _cls.__name__ == _value["__name__"]:
-                        self.__setattr__(_key, _cls(_value))
-                        break
-            else:
-                self.__setattr__(_key, _value)
+    def __init__(self, **kwargs) -> None:
+        for _key, _value in kwargs.items():
+            self.__setattr__(_key, _value)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -35,6 +32,21 @@ class Config:
             self.__setattr__(_key, _value)
 
     @classmethod
+    def from_dict(cls, data: Dict):
+        kwargs = dict()
+        data.pop("__name__", None)
+        for _key, _value in data.items():
+            if isinstance(_value, dict) and "__name__" in _value:
+                for _cls in Config.subclasses:
+                    if _cls.__name__ == _value["__name__"]:
+                        _value.pop("__name__")
+                        kwargs[_key] = _cls.from_dict(_value)
+                        break
+            else:
+                kwargs[_key] = _value
+        return cls(**kwargs)
+
+    @classmethod
     def from_json(cls, fname: str):
         """Converts a json file into the config
 
@@ -45,30 +57,30 @@ class Config:
             _type_: an instance
         """
         with open(fname, "r") as _f:
-            return cls(json.load(_f))
+            return cls.from_dict(json.load(_f))
 
-    @classmethod
-    def instantiate(cls, _data: Union[str, dict, "Config"]):
-        """Instantiates the data as an object
+    # @classmethod
+    # def instantiate(cls, _data: Union[str, dict, "Config"]):
+    #     """Instantiates the data as an object
 
-        Args:
-            _data (type[T]): str (the path of a file), dict, or Config
+    #     Args:
+    #         _data (type[T]): str (the path of a file), dict, or Config
 
-        Returns:
-            _type_: a Config object
-        """
-        if isinstance(_data, str):
-            return cls.from_json(_data)
-        elif isinstance(_data, dict):
-            return cls(_data)
-        elif isinstance(_data, cls):
-            return _data
-        else:
-            raise TypeError(f"Config {cls} does not support type {type(_data)}")
+    #     Returns:
+    #         _type_: a Config object
+    #     """
+    #     if isinstance(_data, str):
+    #         return cls.from_json(_data)
+    #     elif isinstance(_data, dict):
+    #         return cls.from_dict(_data)
+    #     elif isinstance(_data, cls):
+    #         return _data
+    #     else:
+    #         raise TypeError(f"Config {cls} does not support type {type(_data)}")
 
     def to_dict(self):
         _config_dict = dict()
-        _config_dict["__name__"] = self.__name__
+        _config_dict["__name__"] = self.__class__.__name__
         for _key, _value in self.__dict__.items():
             if _key in self.__hidden__:
                 continue
@@ -92,39 +104,36 @@ class ControlConfig(Config):
 
 
 class LoggingConfig(Config):
-    to_stream: bool
+    to_stream: bool = False
     """The list of controllable variables"""
-    fpath: str
+    fpath: str = ""
     """The list of uncontrollable variables"""
-    fname: str
+    fname: str = ""
 
 
 class SolverConfig(Config):
     __hidden__ = ["options"]
     """The configuration for a pyomo solver"""
 
-    solver_name: str
+    solver_name: str = _DEFAULT_SOLVER
     """The name of a model"""
 
     # default options when calling 'solve' of pyomo solver
-    save_results: bool
+    save_results: bool = False
     """If true, pyomo generates a report in solver.results (not recommended for performance)"""
-    tee: bool
+    tee: bool = False
     """If true, the solver's progress is shown"""
-    warmstart: bool
+    warmstart: bool = False
     """If true, warmstart is given"""
 
     ### Additional options
     threads: Optional[int] = None
 
-    time_limit: Optional[float]
+    time_limit: Optional[float] = None
     """Time limit given to the solver"""
 
     mip_display: bool
     """(for cplex) If true, unwanted logs may be ignored"""
-
-    def __init__(self, data: Dict) -> None:
-        super().__init__(data)
 
     @property
     def options(self):
@@ -154,76 +163,17 @@ class SolverMibSConfig(SolverConfig):
 
 
 class AttractorControlConfig(Config):
-    max_control_size: int
-    """The upper limit to the size of controls"""
-    max_length: int
-    """The upper limit of the length of attractors to discover"""
-
-    allow_empty_attractor: bool
-    """If true, a no good cut removes the controls that induces no attractor
-    Otherwise, an Exception is raised"""
-
-    total_time_limit: Optional[float]
-    logging_config: LoggingConfig
+    max_control_size: int = 0
+    max_length: int = 1
+    allow_empty_attractor: bool = True
+    total_time_limit: Optional[float] = 600
 
 
-class BendersConfig(AttractorControlConfig):  # TODO: inherit AttractorControlConfig
-    solve_separation: bool
-    """If true, a separation problem is solved to boost the performance.
-    Only valid when the max_length is sufficiently large so that every attractor can be found
-    by one of the lower level problems."""
-    preprocess_max_forbidden_trap_space: bool
-    """If true, all maximal forbidden trap spaces are found and add the cuts removing them.
-    This can boost performance if max_control_size is sufficiently large"""
-    separation_heuristic: bool
-    """If true, many variables in the separation problem are fixed. 
-    This may slightly reduce the computation time for separation problems.
-    However, seperation may fail or the resulting constraints may be weak."""
-
-    use_high_point_relaxation: bool
-
-    ### Config objects for solvers
-    master_solver_config: SolverConfig
-    LLP_solver_config: SolverConfig
-    separation_solver_config: SolverConfig
-
-    def __init__(self, data: Dict) -> None:
-        super().__init__(data)
-
-        # validation
-        if (self.max_length != 1) and self.use_high_point_relaxation:
-            raise InvalidConfigError(
-                "The high point relaxation can be only used for is when the length of attractor is 1"
-            )
-        if (not self.solve_separation) and (
-            self.preprocess_max_forbidden_trap_space or self.separation_heuristic
-        ):
-            raise InvalidConfigError(
-                "preprocess_max_forbidden_trap_space and separation_heuristic can be used only when solve_separation is on"
-            )
-
-    def check_fixed_point_configs(self):
-        _message = """The following settings for the fixed point control problem are enforced:
-                \t self.max_length == 1
-                \t self.preprocess_max_forbidden_trap_space == False
-                \t self.solve_separation == False
-                \t self.separation_heuristic == False
-                """
-
-        if not (
-            (self.max_length == 1)
-            and (self.preprocess_max_forbidden_trap_space == False)
-            and (self.solve_separation == False)
-            and (self.separation_heuristic == False)
-        ):
-            if self.enforce:
-                warnings.warn(InvalidConfigWarning(_message))
-                self.max_length = 1
-                self.preprocess_max_forbidden_trap_space = False
-                self.solve_separation = False
-                self.separation_heuristic = False
-            else:
-                raise InvalidConfigError(_message)
+class BendersConfig(AttractorControlConfig):
+    solve_separation: bool = False
+    preprocess_max_forbidden_trap_space: bool = False
+    separation_heuristic: bool = False
+    use_high_point_relaxation: bool = False
 
 
 class MibSBilevelConfig(AttractorControlConfig):
@@ -235,3 +185,11 @@ class MibSBilevelConfig(AttractorControlConfig):
         assert (
             self.solver_config.time_limit == None
         ), "MibS does not allow time limit in SolverConfig"
+
+
+class TotalConfig(Config, Generic[_C]):
+    alg_config: _C
+    master_solver_config: SolverConfig
+    LLP_solver_config: SolverConfig
+    separation_solver_config: SolverConfig
+    logging_config: LoggingConfig

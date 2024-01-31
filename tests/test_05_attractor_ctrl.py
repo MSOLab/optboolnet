@@ -1,12 +1,8 @@
 import pytest
 from optboolnet.exception import EmptyAttractorError
-from optboolnet.instances import load_bn_in_repo, iter_bn_in_repo
-from optboolnet.config import (
-    SolverConfig,
-    BendersConfig,
-    InvalidConfigError,
-    LoggingConfig,
-)
+from optboolnet.instances import load_bn_in_repo
+from optboolnet.config import SolverConfig, LoggingConfig
+from optboolnet.exception import InvalidConfigError
 from optboolnet.algorithm import BendersAttractorControl, BendersFixPointControl
 from itertools import product
 import os, sys
@@ -23,17 +19,17 @@ _FPATH = os.path.dirname(__file__)
 
 
 _solver_config = SolverConfig(
-    {
+    **{
         "solver_name": "gurobi_persistent",
         "save_results": False,
         "tee": False,
         "warmstart": False,
-        "mip_display": 0,
+        # "mip_display": 0,
         "threads": 1,
         "time_limit": 3.0,
     }
 )
-_logging_config = LoggingConfig({"to_stream": False, "fpath": "", "fname": ""})
+_logging_config = LoggingConfig(**{"to_stream": False, "fpath": "", "fname": ""})
 
 
 def setup_function(function):
@@ -47,7 +43,7 @@ def teardown_function(function):
 def test_fixed_point_inconsistency():
     _benders_config_dict = {
         "enforce": False,
-        "max_control_size": 3,
+        "max_control_size": 0,
         "max_length": 1,
         "allow_empty_attractor": False,
         "master_solver_config": _solver_config,
@@ -63,8 +59,10 @@ def test_fixed_point_inconsistency():
     bn = load_bn_in_repo("S1")
     detected = False
     try:
-        _incorrect_benders_config = BendersConfig(_benders_config_dict)
-        alg = BendersFixPointControl("test", bn, _incorrect_benders_config)
+        # _incorrect_benders_config = BendersConfig.from_dict(_benders_config_dict)
+        alg = BendersFixPointControl("test", bn)
+
+        alg.get_control_strategies(**_benders_config_dict)
     except InvalidConfigError as e:
         detected = True
         print("Succesfully handled the exception:\n", e)
@@ -77,10 +75,6 @@ def test_fixed_point_control():
         "max_control_size": 2,
         "max_length": 1,
         "allow_empty_attractor": False,
-        "master_solver_config": _solver_config,
-        "LLP_solver_config": _solver_config,
-        "separation_solver_config": _solver_config,
-        "logging_config": _logging_config,
         "solve_separation": False,
         "preprocess_max_forbidden_trap_space": False,
         "separation_heuristic": False,
@@ -98,14 +92,15 @@ def test_fixed_point_control():
                 inst,
                 _benders_config_dict["use_high_point_relaxation"],
             )
-            alg = BendersFixPointControl(inst, bn, BendersConfig(_benders_config_dict))
+            alg = BendersFixPointControl(inst, bn)
+
+            try:
+                s = alg.get_control_strategies(**_benders_config_dict)
+            except EmptyAttractorError:
+                continue
             assert _benders_config_dict["use_high_point_relaxation"] == isinstance(
                 alg.model_master, AttractorDetectionIP
             )
-            try:
-                alg.run_exhaustive_search()
-            except EmptyAttractorError:
-                continue
 
             assert alg.solution_count == answer
 
@@ -116,10 +111,6 @@ def test_attractor_control():
         "max_control_size": 2,
         "max_length": 4,
         "allow_empty_attractor": False,
-        "master_solver_config": _solver_config,
-        "LLP_solver_config": _solver_config,
-        "separation_solver_config": _solver_config,
-        "logging_config": _logging_config,
         "solve_separation": False,
         "preprocess_max_forbidden_trap_space": False,
         "separation_heuristic": False,
@@ -135,10 +126,8 @@ def test_attractor_control():
             _benders_config_dict["separation_heuristic"],
         ) in product([True, False], [True, False]):
             try:
-                alg = BendersAttractorControl(
-                    inst, bn, BendersConfig(_benders_config_dict)
-                )
-                alg.run_exhaustive_search()
+                alg = BendersAttractorControl(inst, bn)
+                s = alg.get_control_strategies(**_benders_config_dict)
                 assert alg.solution_count == answer
             except InvalidConfigError:
                 detected += 1

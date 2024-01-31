@@ -13,7 +13,7 @@ def test_nusmv_check_attractor():
         "time_limit": 3.0,
     }
     length = 6
-    attr_ip = AttractorDetectionIP("M1", bn, length, SolverConfig(_solver_config))
+    attr_ip = AttractorDetectionIP("M1", bn, length, SolverConfig(**_solver_config))
     attr_ip.make_constr_stability_condition()
     attr_ip.set_constr_target_size(0)
     attr_ip.optimize()
