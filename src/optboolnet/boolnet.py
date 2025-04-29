@@ -7,7 +7,18 @@ from colomoto.types import Hypercube as _Hypercube
 from optboolnet.config import ControlConfig
 from algorecell_types import PermanentPerturbation
 
-
+def contains_and(expr) -> bool:
+    """
+    Recursively check whether `expr` or any sub‐expression is an AND.
+    """
+    # is this node itself an AND?
+    if isinstance(expr, boolean.AND):
+        return True
+    # otherwise, recurse into children
+    for arg in expr.args:
+        if contains_and(arg):
+            return True
+    return False
 class ORClause(boolean.Expression):
     """
 
@@ -45,6 +56,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         control_config: ControlConfig,
         Symbol_class=boolean.Symbol,
         allowed_in_name=(".", "_", ":", "-"),
+        to_cnf: bool = False,
         **kwargs,
     ):
         super().__init__(data, Symbol_class, allowed_in_name)
@@ -66,18 +78,19 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             self[self.phenotype] = kwargs.pop("phenotype_formula")
         for var_name, value in self.fixed_values.items():
             self[var_name] = value
-        # TODO: assert when this formula is not a CNF
-        # TODO: convert to CNF if needed
-        # TODO: check if union of controllable/uncontrollable vars covers the whole vars
-        # TODO: check if control is applied twice
+        assert set(self.controllable_vars).union(set(self.uncontrollable_vars)) == set(
+            self.vars_list
+        )
 
         self.__clause_dict: Dict[str, List[ORClause]] = dict()
         for var_name, CNF_formula in self.items():
+            CNF_formula = self.ba.cnf(CNF_formula) if to_cnf else CNF_formula
             if isinstance(CNF_formula, _FALSE):
                 self.__clause_dict[var_name] = list()
             elif CNF_formula.isliteral or isinstance(
                 CNF_formula, (boolean.OR, _TRUE)
             ):  # single clause
+                assert not contains_and(CNF_formula), f"{var_name}, {CNF_formula} is not a CNF" 
                 self.__clause_dict[var_name] = [ORClause(CNF_formula.literals)]
             elif isinstance(CNF_formula, boolean.AND):  # multiple clauses
                 self.__clause_dict[var_name] = [
@@ -85,6 +98,8 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
                 ]
             else:
                 raise TypeError()
+            
+
 
     def items(self) -> Tuple[str, boolean.Expression]:
         return super().items()
