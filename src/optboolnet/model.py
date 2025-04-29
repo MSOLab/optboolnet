@@ -30,7 +30,6 @@ class LiteralCounter(Iterator):
 
 
 class CoreIP(pmoenv.ConcreteModel):
-
     """The basic extension for handling a Boolean network
     and iterative problem solving with both direct and persitent solver"""
 
@@ -94,6 +93,8 @@ class CoreIP(pmoenv.ConcreteModel):
         self.obj = pmoenv.Objective(expr=1)
         """The objective function, initialized as 1"""
         self.set_objective(1)
+        self.dummy_zero = pmoenv.ScalarVar(domain=[0, 0])
+        self.append_vars_to_solvers([self.dummy_zero])
 
     def update_options_time_limit(self, time_limit: Optional[float]):
         self.solver.options["time_limit"] = time_limit
@@ -208,8 +209,11 @@ class MasterControlIP(CoreIP):
         if control_size == None:
             return
         else:
+            _sum = pmoenv.summation(self.d)
+            if isinstance(_sum, int) and (_sum == 0):
+                _sum = self.dummy_zero
             self.add_constr_to_list(
-                pmoenv.summation(self.d) == control_size,
+                _sum == control_size,
                 self.constrs_target_size,
             )
 
@@ -245,60 +249,67 @@ class MasterControlIP(CoreIP):
             )
 
     def append_no_good_cut_d(self, ctrl: Control):
+        _sum = pmoenv.quicksum(
+            self.d[j, 0] + self.d[j, 1]
+            for j in ctrl.unfixed_vars(self.bn.controllable_vars)
+        ) + pmoenv.quicksum(
+            (1 - self.d[j, k] + self.d[j, 1 - k]) for j, k in ctrl.items()
+        )
+        if isinstance(_sum, int) and (_sum == 0):
+            _sum = self.dummy_zero
         self.add_constr_to_list(
-            pmoenv.quicksum(
-                self.d[j, 0] + self.d[j, 1]
-                for j in ctrl.unfixed_vars(self.bn.controllable_vars)
-            )
-            + pmoenv.quicksum(
-                (1 - self.d[j, k] + self.d[j, 1 - k]) for j, k in ctrl.items()
-            )
-            >= 1,
+            _sum >= 1,
             self.constrs_benders,
         )
         return (EnumCutType.NO_GOOD_MASTER, 2 * len(self.J))
 
     def append_minimality_cut(self, ctrl: Control):
-        if len(ctrl) == 0:  # the resulting cut is 0 >= 1, infeasible
-            self.constr_minimality_infeasible = pmoenv.Constraint.Infeasible()
-        else:
-            self.add_constr_to_list(
-                pmoenv.quicksum((1 - self.d[j, k]) for j, k in ctrl.items()) >= 1,
-                self.constrs_minimality,
-            )
+        _sum = pmoenv.quicksum((1 - self.d[j, k]) for j, k in ctrl.items())
+        if isinstance(_sum, int) and (_sum == 0):
+            _sum = self.dummy_zero
+        self.add_constr_to_list(
+            _sum >= 1,
+            self.constrs_minimality,
+        )
         return (EnumCutType.MINIMALITY, len(ctrl))
 
     def append_logical_benders_cut(self, attr: Attractor):
-        def _gen_terms():
-            for j, k, alpha_j, beta_j in zip(
-                self.J, attr.get_first_state(), attr.alpha, attr.beta
-            ):
-                if beta_j == 1:
-                    yield self.d[j, 1 - k]
-                else:
-                    yield 1 - self.d[j, k]
-                if alpha_j == 0:
-                    yield self.d[j, k]
+        # Build the list of cut‐terms in two passes:
+        #  1) for each j,k,alpha_j,beta_j yield (d[j,1-k] if beta_j==1 else 1 - d[j,k])
+        #  2) for each where alpha_j==0 yield d[j,k]
+        state0 = attr.get_first_state()
+        terms = [
+            (self.d[j, 1 - k] if beta_j == 1 else 1 - self.d[j, k])
+            for j, k, alpha_j, beta_j in zip(self.J, state0, attr.alpha, attr.beta)
+        ] + [
+            self.d[j, k]
+            for j, k, alpha_j, beta_j in zip(self.J, state0, attr.alpha, attr.beta)
+            if alpha_j == 0
+        ]
 
-        iter_terms = LiteralCounter(_gen_terms())
-        self.add_constr_to_list(pmoenv.quicksum(iter_terms) >= 1, self.constrs_benders)
-        return (EnumCutType.ATTRACTOR_CUT, iter_terms.count)
+        # Sum them into a single Pyomo expression
+        expr = pmoenv.quicksum(terms)
+
+        # Add the Benders cut
+        self.add_constr_to_list(expr >= 1, self.constrs_benders)
+        return (EnumCutType.ATTRACTOR_CUT, len(terms))
 
     def append_forbidden_trap_space_cut(
         self, forbidden_ctrl: Control, forbidden_trap_space: Hypercube
     ):
-        def _gen_terms():
-            for j, k in forbidden_ctrl.items():
-                yield (1 - self.d[j, k])
-            for j in forbidden_ctrl.unfixed_vars(self.bn.controllable_vars):
-                try:
-                    yield self.d[j, 1 - forbidden_trap_space[j]]
-                except:
-                    pass
+        # build a flat list of all the terms you want to forbid
+        terms = [1 - self.d[j, k] for j, k in forbidden_ctrl.items()] + [
+            self.d[j, 1 - forbidden_trap_space[j]]
+            for j in forbidden_ctrl.unfixed_vars(self.bn.controllable_vars)
+            if j in forbidden_trap_space
+        ]
 
-        iter_terms = LiteralCounter(_gen_terms())
-        self.add_constr_to_list(pmoenv.quicksum(iter_terms) >= 1, self.constrs_benders)
-        return (EnumCutType.TRAP_SPACE_CUT, iter_terms.count)
+        expr = pmoenv.quicksum(terms)
+        if isinstance(expr, int) and expr == 0:
+            expr = self.dummy_zero
+        self.add_constr_to_list(expr >= 1, self.constrs_benders)
+
+        return (EnumCutType.TRAP_SPACE_CUT, len(terms))
 
     def set_objective_min_control(self):
         return super().set_objective(sum(self.d.values()), True)
