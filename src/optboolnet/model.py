@@ -298,11 +298,14 @@ class MasterControlIP(CoreIP):
         self, forbidden_ctrl: Control, forbidden_trap_space: Hypercube
     ):
         # build a flat list of all the terms you want to forbid
-        terms = [1 - self.d[j, k] for j, k in forbidden_ctrl.items()] + [
-            self.d[j, 1 - forbidden_trap_space[j]]
-            for j in forbidden_ctrl.unfixed_vars(self.bn.controllable_vars)
-            if j in forbidden_trap_space
-        ]
+        terms = list()
+        for j, k in forbidden_ctrl.items():
+            terms.append (1 - self.d[j, k])
+        for j in forbidden_ctrl.unfixed_vars(self.bn.controllable_vars):
+            try:
+                terms.append( self.d[j, 1 - forbidden_trap_space[j]])
+            except:
+                pass
 
         expr = pmoenv.quicksum(terms)
         if isinstance(expr, int) and expr == 0:
@@ -633,7 +636,11 @@ class TrapSpaceDetectionIP(MasterControlIP):
         Args:
             value (int): the value to fix
         """
-        self.fix_var(self.h[self.bn.phenotype, value], 1)
+        # self.fix_var(self.h[self.bn.phenotype, value], 1)
+        self.add_constr_to_list(
+            self.h[self.bn.phenotype, value] == 1,
+            self.constrs_phenotype,
+        )
 
     def add_constr_separation(self, ctrl: Control):
         for j, k in ctrl.items():
