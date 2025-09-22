@@ -7,6 +7,7 @@ from colomoto.types import Hypercube as _Hypercube
 from optboolnet.config import ControlConfig
 from algorecell_types import PermanentPerturbation
 
+
 def contains_and(expr) -> bool:
     """
     Recursively check whether `expr` or any sub‐expression is an AND.
@@ -19,6 +20,8 @@ def contains_and(expr) -> bool:
         if contains_and(arg):
             return True
     return False
+
+
 class ORClause(boolean.Expression):
     """
 
@@ -50,6 +53,9 @@ class ORClause(boolean.Expression):
 
 
 class CNFBooleanNetwork(minibn.BooleanNetwork):
+
+    PHENOTYPE_VAR: str = "PHENOTYPE"
+
     def __init__(
         self,
         data,
@@ -90,7 +96,9 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             elif CNF_formula.isliteral or isinstance(
                 CNF_formula, (boolean.OR, _TRUE)
             ):  # single clause
-                assert not contains_and(CNF_formula), f"{var_name}, {CNF_formula} is not a CNF" 
+                assert not contains_and(
+                    CNF_formula
+                ), f"{var_name}, {CNF_formula} is not a CNF"
                 self.__clause_dict[var_name] = [ORClause(CNF_formula.literals)]
             elif isinstance(CNF_formula, boolean.AND):  # multiple clauses
                 self.__clause_dict[var_name] = [
@@ -98,8 +106,6 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
                 ]
             else:
                 raise TypeError()
-            
-
 
     def items(self) -> Tuple[str, boolean.Expression]:
         return super().items()
@@ -146,6 +152,32 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         ]
         line_list = sorted(line_list) if sort else line_list
         return CNFBooleanNetwork("\n".join(line_list), self._control_config)
+
+    @staticmethod
+    def from_bnet(
+        bn: minibn.BooleanNetwork,
+        inputs: dict = dict(),
+        target: dict = dict(),
+        exclude: list = list(),
+    ):
+        new_bn = minibn.BooleanNetwork(bn)
+        config = ControlConfig()
+        config.fixed_values = inputs.copy()
+        assert len(target) > 0
+        config.uncontrollable_vars = list(set(inputs.keys()).union(set(exclude)))
+        config.uncontrollable_vars.append(CNFBooleanNetwork.PHENOTYPE_VAR)
+        config.controllable_vars = list(set(new_bn.keys()).difference(set(config.uncontrollable_vars)))
+
+        config.phenotype = "PHENOTYPE"
+        cnf_clauses = []
+        for var, value in target.items():
+            if value == 1:
+                cnf_clauses.append(f"{var}")
+            else:
+                cnf_clauses.append(f"~{var}")
+        cnf_formula = " & ".join(cnf_clauses)
+        new_bn[config.phenotype] = cnf_formula
+        return CNFBooleanNetwork(new_bn, config, to_cnf=True)
 
 
 class Attractor:
