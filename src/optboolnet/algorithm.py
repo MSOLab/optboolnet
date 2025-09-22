@@ -252,6 +252,7 @@ class BendersAttractorControl(AttractorControl):
             self.model_separation.fix_control(ctrl)
         else:
             self.model_separation.add_constr_separation(ctrl)
+            self.model_separation.fix_phenotype(0)
 
         # solve the separation closure and possibly add a forbidden trap space cut
         if self._optimize(self.model_separation):
