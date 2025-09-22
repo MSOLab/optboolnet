@@ -24,13 +24,16 @@ requirements:
     - colomoto_jupyter
     - pyomo
     - gurobi
+    - algorecell_types
 
 test:
   files:
     - run_test.bat
+    - run_test.sh
   requires:
     - pip
     - pytest
+    - nusmv
   source_files:
     - ./tests/*.py
     - ./tests/*/*
