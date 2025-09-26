@@ -174,7 +174,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             if value == 1:
                 cnf_clauses.append(f"{var}")
             else:
-                cnf_clauses.append(f"~{var}")
+                cnf_clauses.append(f"!{var}")
         cnf_formula = " & ".join(cnf_clauses)
         new_bn[config.phenotype] = cnf_formula
         return CNFBooleanNetwork(new_bn, config, to_cnf=True)

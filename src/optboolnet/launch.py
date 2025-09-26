@@ -41,11 +41,20 @@ def control_sync_attr_no_separation(
 
 
 def control_fixpoint(
-    bn, max_size: int, target: dict[str, int], exclude: list[str] = list(), **kwargs
+    bn,
+    max_size: int,
+    target: dict[str, int],
+    exclude: list[str] = list(),
+    allow_empty_attractor: bool = True,
+    **kwargs
 ):
     name = kwargs.get("name", "ControlFixpoint")
     convert_bn = CNFBooleanNetwork.from_bnet(bn, target=target, exclude=exclude)
-    s = BendersFixPointControl(name, convert_bn).get_control_strategies(
-        max_control_size=max_size, max_length=1, **kwargs
-    )
+    model = BendersFixPointControl(name, convert_bn)
+    if allow_empty_attractor:
+        model.allow_empty_attractor = True
+    else:
+        model.allow_empty_attractor = False
+        model.use_high_point_relaxation = True
+    s = model.get_control_strategies(max_control_size=max_size, max_length=1, **kwargs)
     return s
