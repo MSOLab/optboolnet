@@ -54,7 +54,7 @@ class ORClause(boolean.Expression):
 
 class CNFBooleanNetwork(minibn.BooleanNetwork):
 
-    PHENOTYPE_VAR: str = "PHENOTYPE"
+    PHENOTYPE_VAR: str = "__PHENOTYPE__"
 
     def __init__(
         self,
@@ -168,7 +168,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         config.uncontrollable_vars.append(CNFBooleanNetwork.PHENOTYPE_VAR)
         config.controllable_vars = list(set(new_bn.keys()).difference(set(config.uncontrollable_vars)))
 
-        config.phenotype = "PHENOTYPE"
+        config.phenotype = CNFBooleanNetwork.PHENOTYPE_VAR
         cnf_clauses = []
         for var, value in target.items():
             if value == 1:
