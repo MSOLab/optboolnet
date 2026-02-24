@@ -8,6 +8,7 @@ def control_sync_attr_separation(
     target: dict[str, int],
     exclude: list[str] = list(),
     max_attr_length: int = 15,
+    allow_empty_attractor: bool = True,
     **kwargs
 ):
     name = kwargs.get("name", "ControlSeparation")
@@ -16,6 +17,7 @@ def control_sync_attr_separation(
         max_control_size=max_size,
         max_length=max_attr_length,
         solve_separation=True,
+        allow_empty_attractor=allow_empty_attractor,
         **kwargs
     )
     return s
@@ -27,6 +29,7 @@ def control_sync_attr_no_separation(
     target: dict[str, int],
     exclude: list[str] = list(),
     max_attr_length: int = 15,
+    allow_empty_attractor: bool = True,
     **kwargs
 ):
     name = kwargs.get("name", "ControlNoSeparation")
@@ -35,6 +38,7 @@ def control_sync_attr_no_separation(
         max_control_size=max_size,
         max_length=max_attr_length,
         solve_separation=False,
+        allow_empty_attractor=allow_empty_attractor,
         **kwargs
     )
     return s
