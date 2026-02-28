@@ -740,6 +740,22 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
                     self.constrs_stability,
                 )
 
+    def fix_length(self, T: int):
+        """Parameterize this model as the T-th LLP by fixing w_T=1 and w_t=0 for t != T.
+
+        With w fixed, the aggregated constraints simplify (per the paper's appendix):
+          - o_t = 1  for all t in [T]  (fixed explicitly here)
+          - p_bar_t = 1 - x[phi,t]  for t in [T]  (follows from o_t=1 via constraints)
+          - y[c,0] = y[c,T]  (enforced by periodicity constraints with w[T]=1)
+        which is equivalent to eq:llp-phenotype-1 and eq:llp-phenotype-2.
+
+        Assumes this model was built with max_length == T so that T_range = range(1, T+1),
+        meaning every t in T_range satisfies t <= T and hence o_t = 1.
+        """
+        for t in self.T_range:
+            self.fix_var(self.w[t], 1 if t == T else 0)
+            self.fix_var(self.o[t], 1)
+
     def set_phenotype_obj(self, _minimize: bool = True):
         self.set_objective(expr=self.p, _minimize=_minimize)
 

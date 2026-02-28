@@ -130,8 +130,9 @@ class BendersAttractorControl(AttractorControl):
         """Use the high point relaxation for the master problem.
         Only valid if the max_length is 1"""
         self.use_aggregated_LLP: bool = False
-        """If true, replace the max_length separate LLPs with a single AggregatedAttractorDetectionIP."""
-        self.model_agg_LLP: Optional[AggregatedAttractorDetectionIP] = None
+        """If true, build max_length parameterized AggregatedAttractorDetectionIP models (one per length)
+        instead of ExtendedAttractorDetectionIP models. Each is derived from the aggregated formulation
+        by calling fix_length(T), which fixes w_T=1 and o_t=1 for all t."""
 
     def validate_config(self):
         if (self.max_length != 1) and self.use_high_point_relaxation:
@@ -183,7 +184,7 @@ class BendersAttractorControl(AttractorControl):
             self.model_separation.set_objective_sparse_cut()
         else:
             self.model_separation = None
-        self.model_LLP_list: List[ExtendedAttractorDetectionIP] = list()
+        self.model_LLP_list = list()
         if self.use_aggregated_LLP:
             self.model_agg_LLP = self._build_model(
                 AggregatedAttractorDetectionIP,
@@ -199,16 +200,17 @@ class BendersAttractorControl(AttractorControl):
         else:
             for length in range(1, self.max_length + 1):
                 model_LLP = self._build_model(
-                    ExtendedAttractorDetectionIP,
+                    AggregatedAttractorDetectionIP,
                     f"{length}",
                     self.bn,
                     length,
                     LLP_solver_config,
                 )
-                model_LLP.fix_var(model_LLP.v, 0)
                 model_LLP.make_constr_stability_condition()
-                model_LLP.make_constr_phenotype_at_all_t()
+                model_LLP.make_constr_periodicity()
+                model_LLP.make_constr_phenotype_and_length()
                 model_LLP.set_phenotype_obj()
+                model_LLP.fix_length(length)
                 self.model_LLP_list.append(model_LLP)
 
         # preprocessing
@@ -295,19 +297,6 @@ class BendersAttractorControl(AttractorControl):
         """
 
         self.step = EnumBendersStep.LOWER_LEVEL_PROBLEM
-        if self.use_aggregated_LLP:
-            self.model_agg_LLP.fix_control(ctrl)
-            if self._optimize(self.model_agg_LLP):
-                if self.model_agg_LLP.p.value == 0:
-                    attr = self.model_agg_LLP.get_attractor()
-                    self._append_cut(self.model_master.append_logical_benders_cut, attr)
-                    return True
-                return False
-            # infeasible: no attractor of any length exists
-            if self.allow_empty_attractor:
-                return False
-            self._append_cut(self.model_master.append_no_good_cut_d, ctrl)
-            return True
         is_feasible = False
         for LLP_model in self.model_LLP_list:
             LLP_model.fix_control(ctrl)

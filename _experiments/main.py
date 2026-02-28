@@ -40,7 +40,7 @@ def main_benders(inst: str, work_dir: str, param_str: str, config: Config):
     attr_ctrl_manager.separation_heuristic = config.separation_heuristic
     attr_ctrl_manager.use_high_point_relaxation = config.use_high_point_relaxation
     attr_ctrl_manager.total_time_limit = config.total_time_limit
-    attr_ctrl_manager.use_aggregated_LLP = True
+    attr_ctrl_manager.use_aggregated_LLP = config.use_aggregated_LLP
     attr_ctrl_manager.get_control_strategies(max_control_size=config.max_control_size, max_length=config.max_length,master_solver_config=config.master_solver_config, LLP_solver_config=config.LLP_solver_config, separation_solver_config=config.separation_solver_config)
 
 
