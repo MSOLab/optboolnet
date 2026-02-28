@@ -9,11 +9,13 @@ from optboolnet.config import BendersConfig, Config, MibSBilevelConfig
 from optboolnet.instances import iter_bn_in_repo, load_bn_in_repo, _INSTANCE_LIST_FULL
 from optboolnet.algorithm import BendersAttractorControl
 
+TIME_MARGIN = 5
+
 def controller(func, stoptime, _args, **_kwargs):
     thr = mp.Process(target=func, args=_args, kwargs=_kwargs)
     thr.daemon = True
     thr.start()
-    thr.join(stoptime)
+    thr.join(stoptime+TIME_MARGIN)
     if thr.is_alive():
         thr.terminate()
         [x.kill() for x in psutil.process_iter() if "mibs" in x.name().lower()]
@@ -38,6 +40,7 @@ def main_benders(inst: str, work_dir: str, param_str: str, config: Config):
     attr_ctrl_manager.separation_heuristic = config.separation_heuristic
     attr_ctrl_manager.use_high_point_relaxation = config.use_high_point_relaxation
     attr_ctrl_manager.total_time_limit = config.total_time_limit
+    attr_ctrl_manager.use_aggregated_LLP = True
     attr_ctrl_manager.get_control_strategies(max_control_size=config.max_control_size, max_length=config.max_length,master_solver_config=config.master_solver_config, LLP_solver_config=config.LLP_solver_config, separation_solver_config=config.separation_solver_config)
 
 
@@ -78,12 +81,13 @@ if __name__ == "__main__":
         _Config = MibSBilevelConfig
     else:
         raise Exception()
-
+        
     for exp_name in exp_name_list:
         print(exp_name)
         rel_path = f"{root_dir}{exp_name}"
         if not os.path.exists(f"{cur_dir}\\{rel_path}"):
             os.makedirs(f"{cur_dir}\\{exp_name}")
+        shutil.copy(__file__, f"{cur_dir}\\{rel_path}\\{cur_fname}.py.backup")
         if os.path.exists(f"{cur_dir}\\{rel_path}\\alg_config.json"):
             with open(f"{cur_dir}\\{rel_path}\\alg_config.json", "r") as _f:
                 alg_config = _Config.from_dict(json.load(_f))
@@ -102,8 +106,8 @@ if __name__ == "__main__":
                 os.makedirs(work_dir)
             # save_bnet_settings(inst, work_dir)
             if alg == "benders":
-                controller(main_benders, args.time_limit, (inst, work_dir, exp_name, alg_config))
-                # main_benders(inst, work_dir, exp_name, alg_config)
+                # controller(main_benders, args.time_limit, (inst, work_dir, exp_name, alg_config))
+                main_benders(inst, work_dir, exp_name, alg_config)
             elif alg == "MibS":
                 # controller(main_MibS, args.time_limit, (inst, work_dir, exp_name, alg_config, args.max_control_size, args.max_length))
                 main_MibS(inst, work_dir, exp_name, alg_config, args.max_control_size, args.max_length)

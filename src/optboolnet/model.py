@@ -512,11 +512,11 @@ class ExtendedAttractorDetectionIP(AttractorDetectionIP):
         self.clear_constr_list(self.constrs_stability)
         for j, t in self.J * self.T_range:
             self.add_constr_to_list(
-                self.d[j, 1] <= self.x[j, t],
+                self.d[j, 1] - self.v <= self.x[j, t],  # x >= d[j,1] - v (eq:llp-controllable-4)
                 self.constrs_stability,
             )
             self.add_constr_to_list(
-                -self.v + self.d[j, 0] <= 1 - self.x[j, t],
+                self.d[j, 0] <= 1 - self.x[j, t],  # x <= 1 - d[j,0] (eq:llp-controllable-3)
                 self.constrs_stability,
             )
 
@@ -560,6 +560,213 @@ class ExtendedAttractorDetectionIP(AttractorDetectionIP):
 
     def set_phenotype_obj(self, _minimize: bool = True):
         self.set_objective(expr=self.p + 2 * self.v, _minimize=_minimize)
+
+
+class AggregatedAttractorDetectionIP(MasterControlIP):
+    """The aggregated LLP that finds attractors of any length up to max_length in a single model.
+
+    Instead of solving max_length separate T-th LLPs, this model uses binary variable
+    w[t]=1 to select the attractor length t and enforces the periodicity condition
+    y[i,c,0] = y[i,c,T*] through the w selection. This corresponds to the aggregated
+    bilevel formulation in the appendix of the IJOC paper.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        bn: CNFBooleanNetwork,
+        max_length: int,
+        solver_setting: SolverConfig,
+        *args,
+        **kwds,
+    ):
+        super().__init__(name, bn, solver_setting, *args, **kwds)
+        self.max_length = max_length
+
+        ### ======== index sets
+
+        self.T_range = pmoenv.Set(initialize=range(1, 1 + max_length))
+        """Time positions 1 to max_length"""
+        self.T_range_0 = pmoenv.Set(initialize=range(0, 1 + max_length))
+        """Time positions 0 to max_length; t=0 is the periodicity reference for y"""
+
+        ### ======== variables
+
+        self.x = pmoenv.Var(self.I * self.T_range, domain=pmoenv.Binary)
+        """x[i,t] denotes the value of variable i at position t"""
+        self.y = pmoenv.Var(self.C * self.T_range_0, domain=pmoenv.Binary)
+        """y[i,c,t] is the truth value of clause c of variable i at time t.
+        y[i,c,0] is the periodicity reference: y[i,c,0] = y[i,c,T*] where T* is the attractor length."""
+        self.p = pmoenv.ScalarVar(domain=pmoenv.Binary)
+        """p = 1 iff the phenotype is satisfied at every active time step"""
+        self.w = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
+        """w[t] = 1 iff the attractor length is exactly t (eq:agg-llp-w-sum)"""
+        self.o = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
+        """o[t] = 1 iff time t is within the attractor, i.e. t <= T* (eq:agg-llp-w-connect-o)"""
+        self.p_bar = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
+        """p_bar[t] = 1 iff the phenotype is violated at active time t (eq:agg-llp-ph-2)"""
+        self.append_vars_to_solvers(
+            [self.x, self.y, self.p, self.w, self.o, self.p_bar]
+        )
+
+        ### ======== constraints
+
+        self.constrs_stability = pmoenv.ConstraintList()
+        """"""
+        self.constrs_phenotype = pmoenv.ConstraintList()
+        """"""
+        self.constrs_periodicity = pmoenv.ConstraintList()
+        """"""
+        self.constrs_no_good_x = pmoenv.ConstraintList()
+        """"""
+
+    def make_constr_phenotype_and_length(self):
+        """Constraints for length selection (w, o) and phenotype satisfaction (p_bar, p).
+
+        Implements eq:agg-llp-w-sum through eq:agg-llp-ph-1.
+        """
+        self.clear_constr_list(self.constrs_phenotype)
+
+        # sum(w) = 1: exactly one attractor length is selected (eq:agg-llp-w-sum)
+        self.add_constr_to_list(
+            pmoenv.summation(self.w) == 1,
+            self.constrs_phenotype,
+        )
+
+        # o[t] = sum(w[t'] for t' >= t): o[t]=1 iff t is an active time step (eq:agg-llp-w-connect-o)
+        for t in self.T_range:
+            self.add_constr_to_list(
+                self.o[t]
+                == pmoenv.quicksum(self.w[t_] for t_ in self.T_range if t_ >= t),
+                self.constrs_phenotype,
+            )
+
+        # p_bar[t] = o[t] * (1 - x[phi,t]): phenotype violated at active time t (eq:agg-llp-ph-2)
+        for t in self.T_range:
+            self.add_constr_to_list(
+                self.p_bar[t] <= self.o[t],
+                self.constrs_phenotype,
+            )
+            self.add_constr_to_list(
+                self.p_bar[t] <= 1 - self.x[self.bn.phenotype, t],
+                self.constrs_phenotype,
+            )
+            self.add_constr_to_list(
+                self.p_bar[t] >= self.o[t] - self.x[self.bn.phenotype, t],
+                self.constrs_phenotype,
+            )
+
+        # p <= 1 - p_bar[t]: if phenotype violated at any active time, p=0 (eq:agg-llp-ph-1)
+        for t in self.T_range:
+            self.add_constr_to_list(
+                self.p <= 1 - self.p_bar[t],
+                self.constrs_phenotype,
+            )
+
+        # p >= 1 - sum(p_bar): if phenotype satisfied at all active times, p=1 (eq:agg-llp-ph-3)
+        self.add_constr_to_list(
+            self.p >= 1 - pmoenv.summation(self.p_bar),
+            self.constrs_phenotype,
+        )
+
+    def make_constr_periodicity(self):
+        """Enforce y[i,c,0] = y[i,c,T*] via the w selection (eq:agg-llp-bary-1).
+
+        -(1 - w[t]) <= y[c,0] - y[c,t] <= (1 - w[t]) for all c, t.
+        When w[t]=1: y[c,0] = y[c,t] (the period-t boundary condition).
+        """
+        self.clear_constr_list(self.constrs_periodicity)
+        for (i, c) in self.C:
+            for t in self.T_range:
+                self.add_constr_to_list(
+                    self.y[i, c, 0] - self.y[i, c, t] <= 1 - self.w[t],
+                    self.constrs_periodicity,
+                )
+                self.add_constr_to_list(
+                    self.y[i, c, t] - self.y[i, c, 0] <= 1 - self.w[t],
+                    self.constrs_periodicity,
+                )
+
+    def make_constr_stability_condition(self):
+        """Transition and literal constraints (no v variable).
+
+        Uses y[i,c,t-1] for the transition at time t; at t=1 this is y[i,c,0],
+        the periodicity reference (eq:agg-llp-uncon-1 through eq:agg-llp-lit-3).
+        """
+        self.clear_constr_list(self.constrs_stability)
+
+        # Fix constraints for controlled genes (eq:agg-llp-fix-0, eq:agg-llp-fix-1)
+        for j, t in self.J * self.T_range:
+            self.add_constr_to_list(
+                self.d[j, 1] <= self.x[j, t],
+                self.constrs_stability,
+            )
+            self.add_constr_to_list(
+                self.d[j, 0] <= 1 - self.x[j, t],
+                self.constrs_stability,
+            )
+
+        # Transition formulas; t_prev = t-1, so at t=1 uses y[i,c,0] (periodicity ref)
+        for i in self.I:
+            (d_0, d_1) = (self.d[i, 0], self.d[i, 1]) if i in self.J else (0, 0)
+            for t in self.T_range:
+                t_prev = t - 1
+                for c in self.C_i[i]:
+                    self.add_constr_to_list(
+                        self.x[i, t] <= self.y[i, c, t_prev] + (d_0 + d_1),
+                        self.constrs_stability,
+                    )
+                self.add_constr_to_list(
+                    self.x[i, t]
+                    >= (1 - len(self.C_i[i]))
+                    + sum(self.y[i, c, t_prev] for c in self.C_i[i])
+                    - (d_0 + d_1),
+                    self.constrs_stability,
+                )
+
+        # Clause-literal synchronization for t in T_range (eq:agg-llp-lit-1 through eq:agg-llp-lit-3)
+        for (i, c), clause in self.bn.iter_clauses():
+            for t in self.T_range:
+                x_lit_list = [self.x[i_, t] for i_ in clause.pos_literals] + [
+                    1 - self.x[i_, t] for i_ in clause.neg_literals
+                ]
+                for x_lit in x_lit_list:
+                    self.add_constr_to_list(
+                        self.y[i, c, t] >= x_lit,
+                        self.constrs_stability,
+                    )
+                self.add_constr_to_list(
+                    self.y[i, c, t] <= sum(x_lit_list),
+                    self.constrs_stability,
+                )
+
+    def set_phenotype_obj(self, _minimize: bool = True):
+        self.set_objective(expr=self.p, _minimize=_minimize)
+
+    def get_attractor(self) -> Attractor:
+        """Extract the attractor determined by the w selection."""
+        T_star = next(t for t in self.T_range if pmoenv.value(self.w[t]) > 0.5)
+        unique_state_seq: List[List[int]] = list()
+        for t in range(1, T_star + 1):
+            new_state = [int(self.x[i, t].value) for i in self.I]
+            if all(new_state != _state for _state in unique_state_seq):
+                unique_state_seq.append(new_state)
+            else:
+                break
+        x_1 = [self.x[j, 1].value for j in self.J]
+        alpha = [
+            all(self.x[j, 1].value == self.x[j, t].value for t in range(1, T_star + 1))
+            for j in self.J
+        ]
+        beta = [
+            all(
+                (self.x[j, t].value == 1)
+                == all(self.y[j, c, t - 1].value == 1 for c in self.C_i[j])
+                for t in range(1, T_star + 1)
+            )
+            for j in self.J
+        ]
+        return Attractor(self.bn, unique_state_seq, x_1, alpha, beta)
 
 
 class TrapSpaceDetectionIP(MasterControlIP):
@@ -684,6 +891,7 @@ Model = TypeVar(
     CoreIP,
     MasterControlIP,
     AttractorDetectionIP,
-    TrapSpaceDetectionIP,
     ExtendedAttractorDetectionIP,
+    AggregatedAttractorDetectionIP,
+    TrapSpaceDetectionIP,
 )
