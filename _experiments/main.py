@@ -44,9 +44,10 @@ def main_benders(inst: str, work_dir: str, param_str: str, config: Config):
     attr_ctrl_manager.get_control_strategies(max_control_size=config.max_control_size, max_length=config.max_length,master_solver_config=config.master_solver_config, LLP_solver_config=config.LLP_solver_config, separation_solver_config=config.separation_solver_config)
 
 
-def main_MibS(inst: str, work_dir: str, param_str: str, config: MibSBilevelConfig, max_control_size: int, max_length: int):
+def main_MibS(inst: str, work_dir: str, param_str: str, config: MibSBilevelConfig):
     bn = load_bn_in_repo(inst)
     attr_ctrl_manager = MibSAttractorControl(param_str, bn, config)
+    attr_ctrl_manager.total_time_limit = config.total_time_limit
     attr_ctrl_manager.get_control_strategies()
 
 
@@ -109,5 +110,5 @@ if __name__ == "__main__":
                 # controller(main_benders, args.time_limit, (inst, work_dir, exp_name, alg_config))
                 main_benders(inst, work_dir, exp_name, alg_config)
             elif alg == "MibS":
-                # controller(main_MibS, args.time_limit, (inst, work_dir, exp_name, alg_config, args.max_control_size, args.max_length))
-                main_MibS(inst, work_dir, exp_name, alg_config, args.max_control_size, args.max_length)
+                # controller(main_MibS, alg_config.total_time_limit, (inst, work_dir, exp_name, alg_config))
+                main_MibS(inst, work_dir, exp_name, alg_config)

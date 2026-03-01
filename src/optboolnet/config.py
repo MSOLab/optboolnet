@@ -174,17 +174,16 @@ class BendersConfig(AttractorControlConfig):
     preprocess_max_forbidden_trap_space: bool = False
     separation_heuristic: bool = False
     use_high_point_relaxation: bool = False
+    use_aggregated_LLP: bool = False
+    """If true, use AggregatedAttractorDetectionIP instead of ExtendedAttractorDetectionIP for each LLP."""
 
 
 class MibSBilevelConfig(AttractorControlConfig):
+    enforce: bool
     use_valid_cuts: bool
+    use_aggregated_LLP: bool = False
+    """If true, use MibSAggBilevelIP (aggregated single LLP) instead of MibSBilevelIP (extensive form)."""
     solver_config: SolverConfig
-
-    def __init__(self, data: Dict) -> None:
-        super().__init__(data)
-        assert (
-            self.solver_config.time_limit == None
-        ), "MibS does not allow time limit in SolverConfig"
 
 
 class TotalConfig(Config, Generic[_C]):
