@@ -1,22 +1,12 @@
 import argparse
+import datetime
 import json
 import os
 from typing import List
 
 from optboolnet.boolnet import Control
-from optboolnet.config import SolverConfig
+from optboolnet.checking import nusmv_check_phenotype
 from optboolnet.instances import load_bn_in_repo, _INSTANCE_LIST_FULL
-from optboolnet.model import ExtendedAttractorDetectionIP
-
-
-LLP_solver_config = {
-    "solver_name": "gurobi_persistent",
-    "save_results": False,
-    "tee": False,
-    "threads": None,
-    "warmstart": False,
-    "time_limit": None,
-}
 
 
 _ALGO_SUBDIRS = ["benders", "MibS"]
@@ -46,28 +36,18 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str]):
                     ctrl_list.append(Control(sol))
         print("\t", len(ctrl_list))
 
-        length_break = False
-        for length in range(4, 101):
-            if length_break:
-                break
-            print(length)
-            model_LLP = ExtendedAttractorDetectionIP(
-                f"{length}", bn, length, SolverConfig(**LLP_solver_config)
-            )
-            model_LLP.fix_var(model_LLP.v, 0)
-            model_LLP.make_constr_stability_condition()
-            model_LLP.make_constr_phenotype_at_all_t()
-            model_LLP.set_phenotype_obj()
-
-            for ctrl in ctrl_list:
-                model_LLP.fix_control(ctrl)
-                if model_LLP.optimize():
-                    if model_LLP.p.value == 0:
-                        print("incorrect", ctrl)
-                        with open(output_file, "a", encoding="utf-8") as _f:
-                            _f.write(f"{work_dir},{inst},{length},{ctrl}\n")
-                        length_break = True
-                        break
+        n = len(ctrl_list)
+        last_pct = 0
+        for i, ctrl in enumerate(ctrl_list):
+            if not nusmv_check_phenotype(bn, control=ctrl):
+                print("incorrect", ctrl)
+                with open(output_file, "a", encoding="utf-8") as _f:
+                    _f.write(f"{work_dir},{inst},{ctrl}\n")
+            pct = (i + 1) * 100 // n
+            milestone = pct // 10 * 10
+            if milestone > last_pct:
+                print(f"\t{milestone}% ({i + 1}/{n})")
+                last_pct = milestone
 
 
 if __name__ == "__main__":
@@ -103,6 +83,15 @@ if __name__ == "__main__":
         help="Output file to write incorrect controls to (default: _experiments/verify_control_log.txt)",
     )
     args = ap.parse_args()
+
+    # Append a run-header line to the output file
+    _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
+    _insts_str = ", ".join(args.instances)
+    with open(args.output, "a", encoding="utf-8") as _f:
+        _f.write(
+            f"# [{_timestamp}] work_dirs=[{_dirs_str}] instances=[{_insts_str}]\n"
+        )
 
     if args.work_dirs:
         work_dir_list = args.work_dirs

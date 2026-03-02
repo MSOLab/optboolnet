@@ -87,14 +87,19 @@ def _nusmv_alltrue(nusmv_input, smvfile):
     tmp_smvfile = smvfile is None
     if tmp_smvfile:
         _, smvfile = tempfile.mkstemp(suffix=".smv")
+    mc = None
     try:
         with open(smvfile, "w") as fp:
             fp.write(nusmv_input)
         mc = NuSMV(smvfile)
         return mc.alltrue()
     finally:
+        mc = None  # release NuSMV handles before unlinking (required on Windows)
         if tmp_smvfile:
-            os.unlink(smvfile)
+            try:
+                os.unlink(smvfile)
+            except PermissionError:
+                pass
 
 
 def nusmv_check_attractor(
