@@ -197,6 +197,7 @@ class BendersAttractorControl(AttractorControl):
             self.model_agg_LLP.make_constr_periodicity()
             self.model_agg_LLP.make_constr_phenotype_and_length()
             self.model_agg_LLP.set_phenotype_obj()
+            self.model_LLP_list.append(self.model_agg_LLP)
         else:
             for length in range(1, self.max_length + 1):
                 model_LLP = self._build_model(
