@@ -121,8 +121,15 @@ def collect_metric(
 
 
 # ---------------------------------------------------------------------------
-# Summary table (horizontal join across metrics)
+# Summary tables (horizontal join across metrics)
 # ---------------------------------------------------------------------------
+
+def _str_inst(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast 'inst' to str so Categorical dtype doesn't break merges."""
+    df = df.copy()
+    df["inst"] = df["inst"].astype(str)
+    return df
+
 
 def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
     """
@@ -151,12 +158,6 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
         if left is None:
             return right.copy()
         return left.merge(right, on=key, how="outer")
-
-    def _str_inst(df):
-        """Cast 'inst' to str so Categorical doesn't break merges."""
-        df = df.copy()
-        df["inst"] = df["inst"].astype(str)
-        return df
 
     # -- Level-aware metrics (join key includes level) -----------------------
 
@@ -227,6 +228,114 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
 
     # Backfill max_length from any metric that carries it (in case build_time
     # was not collected).
+    if "max_length" not in result.columns:
+        for df in metric_dfs.values():
+            if "max_length" in df.columns:
+                ml = _str_inst(df)[_INST_KEY + ["max_length"]].drop_duplicates()
+                result = result.merge(ml, on=_INST_KEY, how="left")
+                break
+
+    return result
+
+
+def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+    """
+    Join metric DataFrames into a wide per-(experiment, inst) table by
+    aggregating away the level dimension.
+
+    Aggregations applied:
+      completion_time   → value at the highest level (total wall-clock time)
+      solution_count    → sum over levels  →  total_solutions
+      count_cuts        → sum over levels, pivoted by cut_type  →  count_cuts_<TYPE>
+      build_time        → direct  (+ max_length)
+      max_level         → direct
+      avg_cuts          → pivoted by cut_type  →  avg_cuts_<TYPE>
+      computation_time  → pivoted by step      →  time_<STEP>
+    """
+    if not metric_dfs:
+        return None
+
+    _INST_KEY = ["experiment", "inst"]
+    result: pd.DataFrame | None = None
+
+    def _merge(left, right):
+        if left is None:
+            return right.copy()
+        return left.merge(right, on=_INST_KEY, how="outer")
+
+    # build_time: (experiment, inst, build_time, max_length)
+    if "build_time" in metric_dfs:
+        df = _str_inst(metric_dfs["build_time"])
+        cols = [c for c in [*_INST_KEY, "max_length", "build_time"] if c in df.columns]
+        result = _merge(result, df[cols])
+
+    # max_level: (experiment, inst, max_level)
+    if "max_level" in metric_dfs:
+        df = _str_inst(metric_dfs["max_level"])[_INST_KEY + ["max_level"]]
+        result = _merge(result, df)
+
+    # completion_time: value at the highest level per inst
+    if "completion_time" in metric_dfs:
+        df = _str_inst(metric_dfs["completion_time"])
+        df = (
+            df.loc[df.groupby(_INST_KEY)["level"].idxmax()]
+            [_INST_KEY + ["completion_time"]]
+        )
+        result = _merge(result, df)
+
+    # solution_count: sum sol across all levels
+    if "solution_count" in metric_dfs:
+        df = (
+            _str_inst(metric_dfs["solution_count"])
+            .groupby(_INST_KEY, as_index=False)["sol"]
+            .sum()
+            .rename(columns={"sol": "total_solutions"})
+        )
+        result = _merge(result, df)
+
+    # avg_cuts: pivot by cut_type → avg_cuts_<TYPE>
+    if "avg_cuts" in metric_dfs:
+        df = _str_inst(metric_dfs["avg_cuts"])
+        if not df.empty:
+            df = (
+                df.pivot_table(index=_INST_KEY, columns="cut_type", values="num_literals")
+                .rename(columns=lambda c: f"avg_cuts_{c}")
+                .reset_index()
+            )
+            df.columns.name = None
+            result = _merge(result, df)
+
+    # count_cuts: sum over levels, then pivot by cut_type → count_cuts_<TYPE>
+    if "count_cuts" in metric_dfs:
+        df = _str_inst(metric_dfs["count_cuts"])
+        if not df.empty:
+            df = (
+                df.groupby(_INST_KEY + ["cut_type"], as_index=False)["count_cuts"]
+                .sum()
+                .pivot_table(index=_INST_KEY, columns="cut_type", values="count_cuts")
+                .rename(columns=lambda c: f"count_cuts_{c}")
+                .reset_index()
+            )
+            df.columns.name = None
+            result = _merge(result, df)
+
+    # computation_time: pivot by step → time_<STEP>
+    if "computation_time" in metric_dfs:
+        df = _str_inst(metric_dfs["computation_time"])
+        if not df.empty:
+            df = (
+                df.pivot_table(
+                    index=_INST_KEY, columns="step", values="solve_time", aggfunc="sum"
+                )
+                .rename(columns=lambda c: f"time_{c}")
+                .reset_index()
+            )
+            df.columns.name = None
+            result = _merge(result, df)
+
+    if result is None:
+        return None
+
     if "max_length" not in result.columns:
         for df in metric_dfs.values():
             if "max_length" in df.columns:
@@ -322,16 +431,20 @@ def main() -> None:
         else:
             print("  (no data)")
 
-    # --- Build and write the horizontal summary table -----------------------
-    print(f"\n  {'summary':<30}", end="", flush=True)
-    summary_df = build_summary_table(metric_dfs)
-    if summary_df is not None and not summary_df.empty:
-        out_path = os.path.join(output_dir, "summary.csv")
-        summary_df.to_csv(out_path, index=False)
-        print(f"{len(summary_df):>6} rows  →  {out_path}")
-        written.append(out_path)
-    else:
-        print("  (no data)")
+    # --- Build and write summary tables -------------------------------------
+    for label, builder, fname in [
+        ("summary (per level)",    build_summary_table,   "summary.csv"),
+        ("summary (per inst)",     build_per_inst_table,  "summary_per_inst.csv"),
+    ]:
+        print(f"\n  {label:<30}", end="", flush=True)
+        df = builder(metric_dfs)
+        if df is not None and not df.empty:
+            out_path = os.path.join(output_dir, fname)
+            df.to_csv(out_path, index=False)
+            print(f"{len(df):>6} rows  →  {out_path}")
+            written.append(out_path)
+        else:
+            print("  (no data)")
 
     print(f"\nDone. {len(written)} CSV file(s) written to '{output_dir}'.")
 
