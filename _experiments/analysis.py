@@ -132,19 +132,22 @@ class BendersAnalysis:
     @property
     def completion_time(self):
         if len(self.solve_log) == 0:
-            return (
-                pd.DataFrame(
-                    [[*self.options, self.inst, 0, np.nan]],
-                    columns=self.key_list + ["level", "completion_time"],
-                )
+            return pd.DataFrame(
+                [[*self.options, self.inst, 0, np.nan, False]],
+                columns=self.key_list + ["level", "completion_time", "level_finished"],
             )
-        return (
+        time_df = (
             self.solve_log[self.key_list + ["level", "timestamp"]]
             .groupby(self.key_list + ["level"])
             .max()
             .rename(columns={"timestamp": "completion_time"})
             .reset_index()
         )
+        finished_levels = self.solve_log.loc[
+            self.solve_log["step"] == EnumBendersStep.FINISHED.name, "level"
+        ].unique()
+        time_df["level_finished"] = time_df["level"].isin(finished_levels)
+        return time_df
 
     @property
     def computation_time(self):

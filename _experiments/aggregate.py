@@ -69,6 +69,9 @@ def make_completion_time(ct: pd.DataFrame, variant: str | None) -> pd.DataFrame:
         ct = ct[ct["experiment"].str.endswith(variant)]
     ct["label"] = ct["experiment"].map(lambda e: LABEL_MAP.get(e, e))
 
+    if "level_finished" in ct.columns:
+        ct["completion_time"] = ct["completion_time"].where(ct["level_finished"])
+
     inst_present = [i for i in INST_ORDER if i in ct["inst"].values]
     labels_ordered = sorted(ct["label"].unique())
     ml_values = sorted(ct["max_length"].unique())

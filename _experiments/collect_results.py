@@ -161,10 +161,11 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
 
     # -- Level-aware metrics (join key includes level) -----------------------
 
-    # completion_time: (experiment, inst, level, completion_time)
+    # completion_time: (experiment, inst, level, completion_time, level_finished)
     if "completion_time" in metric_dfs:
-        df = _str_inst(metric_dfs["completion_time"])[_LEVEL_KEY + ["completion_time"]]
-        result = _merge(result, df, _LEVEL_KEY)
+        df = _str_inst(metric_dfs["completion_time"])
+        cols = _LEVEL_KEY + [c for c in ["completion_time", "level_finished"] if c in df.columns]
+        result = _merge(result, df[cols], _LEVEL_KEY)
 
     # solution_count: (experiment, inst, level, sol)
     if "solution_count" in metric_dfs:
@@ -274,14 +275,17 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
         df = _str_inst(metric_dfs["max_level"])[_INST_KEY + ["max_level"]]
         result = _merge(result, df)
 
-    # completion_time: value at the highest level per inst
+    # completion_time: value at the highest *finished* level per inst
     if "completion_time" in metric_dfs:
         df = _str_inst(metric_dfs["completion_time"])
-        df = (
-            df.loc[df.groupby(_INST_KEY)["level"].idxmax()]
-            [_INST_KEY + ["completion_time"]]
-        )
-        result = _merge(result, df)
+        if "level_finished" in df.columns:
+            df = df[df["level_finished"]]
+        if not df.empty:
+            df = (
+                df.loc[df.groupby(_INST_KEY)["level"].idxmax()]
+                [_INST_KEY + ["completion_time"]]
+            )
+            result = _merge(result, df)
 
     # solution_count: sum sol across all levels
     if "solution_count" in metric_dfs:
