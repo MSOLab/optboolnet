@@ -8,8 +8,9 @@ from optboolnet.instances import load_bn_in_repo
 
 
 def main_MibS(inst: str, work_dir: str, param_str: str, config: MibSBilevelConfig):
+    model_name = "INTERDICTION" if config.use_interdiction else "BILEVEL"
     bn = load_bn_in_repo(inst)
-    attr_ctrl_manager = MibSAttractorControl(param_str, bn, config)
+    attr_ctrl_manager = MibSAttractorControl(model_name, bn, config)
     attr_ctrl_manager.total_time_limit = config.total_time_limit
     attr_ctrl_manager.get_control_strategies()
 
