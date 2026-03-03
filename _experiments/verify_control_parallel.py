@@ -4,31 +4,53 @@ import json
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 from optboolnet.boolnet import Control
-from optboolnet.checking import nusmv_check_phenotype
+from optboolnet.checking import nusmv_check_phenotype_full
 from optboolnet.instances import load_bn_in_repo, _INSTANCE_LIST_FULL
 
 
 _ALGO_SUBDIRS = ["benders", "MibS"]
 
-# Per-worker BN cache: {inst_name: bn}. Persists for the lifetime of each
-# worker process so each BN is loaded at most once per worker.
-_worker_bns = {}
+# ---------------------------------------------------------------------------
+# Per-worker state (each worker process has its own copy)
+# ---------------------------------------------------------------------------
+
+# BN cache: avoid reloading the same network within a single worker process.
+_worker_bns: dict = {}
 
 
-def _check_ctrl_for_inst(inst_name: str, ctrl: Control):
+def _check_ctrl_for_inst(
+    inst_name: str, ctrl: Control
+) -> Tuple[bool, float, Optional[int]]:
     if inst_name not in _worker_bns:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
     t0 = time.perf_counter()
-    ok = nusmv_check_phenotype(bn, control=ctrl)
+    ok, loop_len = nusmv_check_phenotype_full(bn, control=ctrl)
     elapsed = time.perf_counter() - t0
-    return inst_name, ctrl, ok, elapsed
+    return ok, elapsed, loop_len
 
 
-def _find_sol_path(work_dir: str, inst: str):
+# ---------------------------------------------------------------------------
+# Main-process result cache (persists across all work_dirs in a single run)
+# ---------------------------------------------------------------------------
+
+# Key: (inst_name, ctrl_key)  Value: (ok, elapsed, loop_len)
+_result_cache: Dict[tuple, Tuple[bool, float, Optional[int]]] = {}
+
+
+def _ctrl_key(ctrl: Control) -> tuple:
+    return tuple(sorted(ctrl.items()))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_sol_path(work_dir: str, inst: str) -> Optional[str]:
     for subdir in _ALGO_SUBDIRS:
         path = os.path.join(work_dir, subdir, inst, "sol.json")
         if os.path.exists(path):
@@ -36,14 +58,35 @@ def _find_sol_path(work_dir: str, inst: str):
     return None
 
 
+def _log_result(
+    output_file: str,
+    work_dir: str,
+    inst: str,
+    ctrl: Control,
+    ok: bool,
+    elapsed: float,
+    loop_len: Optional[int],
+):
+    if ok:
+        line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
+    else:
+        print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s, loop={loop_len})")
+        line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s,loop={loop_len}"
+    with open(output_file, "a", encoding="utf-8") as _f:
+        _f.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
+
+
 def verify_work_dir(work_dir: str, output_file: str, instances: List[str], workers: int):
     print(work_dir)
 
-    # Collect all (inst, ctrl) pairs across every instance up front so that a
-    # single pool can draw from all of them and CPU stays fully utilised even
-    # when one instance has fewer controls than the number of workers.
-    all_pairs: List[tuple] = []
-    inst_counts = {}
+    # Collect all (inst, ctrl) pairs across every instance up front.
+    all_pairs: List[Tuple[str, Control]] = []
+    inst_counts: Dict[str, int] = {}
     for inst in instances:
         sol_path = _find_sol_path(work_dir, inst)
         if sol_path is None:
@@ -63,27 +106,53 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
     total = len(all_pairs)
     if total == 0:
         return
-    print(f"\tTotal: {total} checks across {len(inst_counts)} instance(s), {workers} workers")
 
-    completed_by_inst = {inst: 0 for inst in inst_counts}
-    last_pct_by_inst = {inst: 0 for inst in inst_counts}
+    # Split into cached (already verified in a previous work_dir) and to-run.
+    to_run: List[Tuple[str, Control, tuple]] = []
+    for inst, ctrl in all_pairs:
+        key = (inst, _ctrl_key(ctrl))
+        if key not in _result_cache:
+            to_run.append((inst, ctrl, key))
 
+    n_cached = total - len(to_run)
+    print(
+        f"\tTotal: {total} checks ({n_cached} cached, {len(to_run)} to compute)"
+        f" across {len(inst_counts)} instance(s), {workers} workers"
+    )
+
+    # Flush cached results immediately (no NuSMV call needed).
+    for inst, ctrl in all_pairs:
+        key = (inst, _ctrl_key(ctrl))
+        if key in _result_cache:
+            ok, elapsed, loop_len = _result_cache[key]
+            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed, loop_len)
+
+    if not to_run:
+        return
+
+    # Per-instance progress tracking (only counts non-cached checks).
+    inst_to_run_count: Dict[str, int] = {}
+    for inst, ctrl, key in to_run:
+        inst_to_run_count[inst] = inst_to_run_count.get(inst, 0) + 1
+    completed_by_inst = {inst: 0 for inst in inst_to_run_count}
+    last_pct_by_inst = {inst: 0 for inst in inst_to_run_count}
+
+    # Submit all pairs from all instances to a single pool so the CPU stays
+    # busy even when instances have unequal numbers of controls.
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_check_ctrl_for_inst, inst, ctrl): (inst, ctrl)
-            for inst, ctrl in all_pairs
+            executor.submit(_check_ctrl_for_inst, inst, ctrl): (inst, ctrl, key)
+            for inst, ctrl, key in to_run
         }
         for future in as_completed(futures):
-            inst, ctrl, ok, elapsed = future.result()
+            inst, ctrl, key = futures[future]
+            ok, elapsed, loop_len = future.result()
+
+            _result_cache[key] = (ok, elapsed, loop_len)
+            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed, loop_len)
+
             completed_by_inst[inst] += 1
-
-            if not ok:
-                print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s)")
-                with open(output_file, "a", encoding="utf-8") as _f:
-                    _f.write(f"{work_dir},{inst},{ctrl},{elapsed:.1f}s\n")
-
-            # Per-instance progress milestones
-            n = inst_counts[inst]
+            n = inst_to_run_count[inst]
             c = completed_by_inst[inst]
             pct = c * 100 // n
             milestone = pct // 10 * 10
@@ -91,6 +160,10 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
                 print(f"\t[{inst}] {milestone}% ({c}/{n})")
                 last_pct_by_inst[inst] = milestone
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
@@ -125,7 +198,7 @@ if __name__ == "__main__":
         "--output",
         metavar="FILE",
         default="_experiments/verify_control_log.txt",
-        help="Output file to write incorrect controls to (default: _experiments/verify_control_log.txt)",
+        help="Output file to write results to (default: _experiments/verify_control_log.txt)",
     )
     ap.add_argument(
         "--workers",
