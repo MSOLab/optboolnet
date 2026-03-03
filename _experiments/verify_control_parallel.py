@@ -44,10 +44,10 @@ def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int]
 
 # ---------------------------------------------------------------------------
 # Main-process result cache (persists across all work_dirs in a single run)
+# Key: (inst_name, ctrl_key)  Value: ok (bool only — elapsed is not stored)
 # ---------------------------------------------------------------------------
 
-# Key: (inst_name, ctrl_key)  Value: (ok, elapsed)
-_result_cache: Dict[tuple, Tuple[bool, float]] = {}
+_result_cache: Dict[tuple, bool] = {}
 
 
 def _ctrl_key(ctrl: Control) -> tuple:
@@ -82,6 +82,13 @@ def _log_result(
         line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
+
+
+def _log_instance_done(output_file: str, work_dir: str, inst: str):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\t[{inst}] done ({ts})")
+    with open(output_file, "a", encoding="utf-8") as _f:
+        _f.write(f"{work_dir},{inst},DONE,{ts}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -137,22 +144,26 @@ def verify_work_dir(
 
     incorrect: List[Tuple[str, str, Control]] = []
 
-    # Flush cached results immediately.
+    # Flush cached results immediately (elapsed logged as 0.0s).
     for inst, ctrl in all_pairs:
         key = (inst, _ctrl_key(ctrl))
         if key in _result_cache:
-            ok, elapsed = _result_cache[key]
-            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
+            ok = _result_cache[key]
+            _log_result(output_file, work_dir, inst, ctrl, ok, 0.0)
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
+
+    # Instances with no non-cached controls are fully done after the cache flush.
+    inst_to_run_count: Dict[str, int] = {}
+    for inst, ctrl, key in to_run:
+        inst_to_run_count[inst] = inst_to_run_count.get(inst, 0) + 1
+    for inst in inst_counts:
+        if inst not in inst_to_run_count:
+            _log_instance_done(output_file, work_dir, inst)
 
     if not to_run:
         return incorrect
 
-    # Per-instance progress tracking (non-cached checks only).
-    inst_to_run_count: Dict[str, int] = {}
-    for inst, ctrl, key in to_run:
-        inst_to_run_count[inst] = inst_to_run_count.get(inst, 0) + 1
     completed_by_inst = {inst: 0 for inst in inst_to_run_count}
     last_pct_by_inst = {inst: 0 for inst in inst_to_run_count}
 
@@ -165,7 +176,7 @@ def verify_work_dir(
             inst, ctrl, key = futures[future]
             ok, elapsed = future.result()
 
-            _result_cache[key] = (ok, elapsed)
+            _result_cache[key] = ok
             _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
@@ -173,11 +184,15 @@ def verify_work_dir(
             completed_by_inst[inst] += 1
             n = inst_to_run_count[inst]
             c = completed_by_inst[inst]
+
             pct = c * 100 // n
             milestone = pct // 10 * 10
             if milestone > last_pct_by_inst[inst]:
                 print(f"\t[{inst}] {milestone}% ({c}/{n})")
                 last_pct_by_inst[inst] = milestone
+
+            if c == n:
+                _log_instance_done(output_file, work_dir, inst)
 
     return incorrect
 
