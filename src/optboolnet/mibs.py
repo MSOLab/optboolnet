@@ -10,7 +10,7 @@ from optboolnet import CNFBooleanNetwork
 from optboolnet.boolnet import CNFBooleanNetwork, Control
 from optboolnet.config import MibSBilevelConfig, SolverMibSConfig
 from optboolnet.log import BendersLogger, EnumBendersStep
-from optboolnet.model import MasterControlIP
+from optboolnet.model import MasterControlIP, InterdictMasterControlIP
 from optboolnet.algorithm import AttractorControl
 
 
@@ -443,7 +443,7 @@ class MibSAggBilevelIP(MasterControlIP):
         return _run_mibs(self)
 
 
-class MibSInterdictBilevelIP(MasterControlIP):
+class MibSInterdictBilevelIP(InterdictMasterControlIP):
     """Explicit interdiction bilevel model (max-min formulation).
 
     Follows the interdiction formulation in the IJOC paper:
@@ -482,7 +482,7 @@ class MibSInterdictBilevelIP(MasterControlIP):
         self.solver_config = solver_config
         self.length = length
 
-        # ---- index sets ----
+        # ---- index sets ----        
         self.T_range = pmoenv.Set(initialize=range(1, 1 + length))
         """Time positions 1..T_max"""
         self.T_range_0 = pmoenv.Set(initialize=range(0, 1 + length))
@@ -494,10 +494,8 @@ class MibSInterdictBilevelIP(MasterControlIP):
         self.LLP = SubModel(fixed=[self.d])
 
         # ---- LLP variables ----
-        self.LLP.delta = pmoenv.Var(self.J * self.B, domain=pmoenv.Binary)
-        """delta[j,k]=1 auxiliary interdiction variable for k in {0,1}"""
-        self.LLP.delta_star = pmoenv.Var(self.J, domain=pmoenv.Binary)
-        """delta_star[j] auxiliary interdiction variable for k=* (uncontrolled)"""
+        self.LLP.delta = pmoenv.Var(self.J * self.K_star, domain=pmoenv.Binary)
+        """delta[j,k]=1 auxiliary interdiction variable for k in {0,1,2}"""
         self.LLP.x = pmoenv.Var(self.I * self.T_range, domain=pmoenv.Binary)
         """x[i,t] = state of gene i at time t"""
         self.LLP.y = pmoenv.Var(self.C * self.T_range_0, domain=pmoenv.Binary)
@@ -513,17 +511,24 @@ class MibSInterdictBilevelIP(MasterControlIP):
         # ULP objective: minimise -p  ≡  maximise p  (interdiction structure)
         self.obj = pmoenv.Objective(expr=-self.LLP.p, sense=pmoenv.minimize)
 
-        # ---- ULP linking constraints (interdict): delta^k_j <= 1 - d^k_j ----
-        # These are ULP constraints that reference LLP variables (standard in PAO).
-        self.constrs_interdict = pmoenv.ConstraintList()
+        # ---- LLP interdiction coupling: delta^k_j <= 1 - d^k_j ----
+        # These MUST be LLP constraints so that d (a ULP variable) appears in the
+        # LLP constraint matrix (E matrix in MibS notation).  A zero E matrix causes
+        # MibS to report infeasible even when the problem has solutions.
+        #
+        # Semantics:
+        #   d[j,0]=1 (fix to 0)  → delta[j,0]=0 → x[j,t]<=0, i.e. x[j,t]=0
+        #   d[j,1]=1 (fix to 1)  → delta[j,1]=0 → x[j,t]>=1, i.e. x[j,t]=1
+        #   d[j,2]=1 (free)      → delta[j,2]=0 → dynamics constraints bind
+        self.LLP.constrs_interdict = pmoenv.ConstraintList()
         for j in self.J:
             # delta^0_j <= 1 - d^0_j
-            self.constrs_interdict.add(self.LLP.delta[j, 0] <= 1 - self.d[j, 0])
+            self.LLP.constrs_interdict.add(self.LLP.delta[j, 0] <= 1 - self.d[j, 0])
             # delta^1_j <= 1 - d^1_j
-            self.constrs_interdict.add(self.LLP.delta[j, 1] <= 1 - self.d[j, 1])
-            # delta^*_j <= 1 - d^*_j = d^0_j + d^1_j  (since d^* = 1 - d^0 - d^1)
-            self.constrs_interdict.add(
-                self.LLP.delta_star[j] <= self.d[j, 0] + self.d[j, 1]
+            self.LLP.constrs_interdict.add(self.LLP.delta[j, 1] <= 1 - self.d[j, 1])
+            # delta^*_j <= 1 - d^*_j  (explicit d[j,2] avoids needing d^0+d^1 on RHS)
+            self.LLP.constrs_interdict.add(
+                self.LLP.delta[j, 2] <= 1 - self.d[j, 2]
             )
 
         # ---- LLP constraints ----
@@ -585,7 +590,7 @@ class MibSInterdictBilevelIP(MasterControlIP):
                 for c in self.C_i[j]:
                     self.LLP.constrs_stability.add(
                         self.LLP.x[j, t]
-                        <= self.LLP.y[j, c, t_prev] + self.LLP.delta_star[j]
+                        <= self.LLP.y[j, c, t_prev] + self.LLP.delta[j, 2]
                     )
 
                 # (con-2) x[j,t] >= 1 - sum_c (1-y[c,t-1]) - delta^*_j
@@ -595,7 +600,7 @@ class MibSInterdictBilevelIP(MasterControlIP):
                     - pmoenv.quicksum(
                         1 - self.LLP.y[j, c, t_prev] for c in self.C_i[j]
                     )
-                    - self.LLP.delta_star[j]
+                    - self.LLP.delta[j, 2]
                 )
 
         # (uncon-1), (uncon-2) for uncontrollable genes i in J_c
@@ -693,7 +698,7 @@ class MibSAttractorControl(AttractorControl):
             self.step = EnumBendersStep.FULL_BILEVEL
             _solution_list = list()
             self.model_bilevel.set_constr_target_size(self.target_size)
-            while not self.is_timeout and self._optimize(self.model_bilevel):
+            while not self.is_timeout and self._optimize(self.model_bilevel) and self.is_phenotype_satisfied():
                 ctrl = self.model_bilevel.get_control()
                 _solution_list.append(ctrl)
                 self._append_cut(self.model_bilevel.append_minimality_cut, ctrl)
@@ -704,3 +709,11 @@ class MibSAttractorControl(AttractorControl):
             self.logger.solve_logger_info(self.log_signature)
         self.logger.write_controls_to_json(self.solution_dict)
         return self.solution_dict
+
+    def is_phenotype_satisfied(self):
+        # In the interdiction model, the LLP objective is exactly p, so we can read p directly. Otherwise, don't check
+        if self._config.use_interdiction:
+            return pmoenv.value(self.model_bilevel.LLP.p) > 0.5
+        else:
+            return True  
+        

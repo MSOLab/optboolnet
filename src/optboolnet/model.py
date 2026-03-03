@@ -66,6 +66,9 @@ class CoreIP(pmoenv.ConcreteModel):
 
         self.B = pmoenv.Set(initialize=[0, 1])
         """The Boolean domain"""
+        self.K_star = pmoenv.Set(initialize=[0, 1, 2])
+        """Three-way control domain: 0=fix-to-0, 1=fix-to-1, 2=uncontrolled"""
+        
         self.I = pmoenv.Set(initialize=list(bn.keys()))
         """The set of variables"""
         self.J = pmoenv.Set(initialize=bn.controllable_vars)
@@ -316,6 +319,79 @@ class MasterControlIP(CoreIP):
 
     def set_objective_min_control(self):
         return super().set_objective(sum(self.d.values()), True)
+
+
+class InterdictMasterControlIP(CoreIP):
+    """CoreIP with explicit three-way control variables d[j,k], k in {0,1,2}.
+
+    k=0: gene j is fixed to 0  (d^0_j = 1)
+    k=1: gene j is fixed to 1  (d^1_j = 1)
+    k=2: gene j is uncontrolled (d^*_j = 1)
+
+    Exactly one of {d[j,0], d[j,1], d[j,2]} equals 1 for each j in J
+    (equality exclusivity).  Control size counts only k in {0,1}.
+
+    Intended for interdiction bilevel models where the coupling constraints
+    delta[j,k] <= 1 - d[j,k] must live in the LLP so that MibS detects the
+    non-zero E matrix (ULP vars appearing in LLP constraints).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        bn: CNFBooleanNetwork,
+        solver_setting: SolverConfig,
+        *args,
+        **kwds
+    ):
+        super().__init__(name, bn, solver_setting, *args, **kwds)
+
+        self.d = pmoenv.Var(self.J * self.K_star, domain=pmoenv.Binary)
+        """d[j,k]=1 iff variable j is in control state k for all j in J, k in {0,1,2}"""
+        self.append_vars_to_solvers([self.d])
+
+        self.constrs_target_size = pmoenv.ConstraintList()
+        self.constrs_exclusivity = pmoenv.ConstraintList()
+        self.constrs_minimality = pmoenv.ConstraintList()
+        self.constrs_benders = pmoenv.ConstraintList()
+
+        self.make_constr_exclusivity()
+
+    def set_constr_target_size(self, control_size: int):
+        self.clear_constr_list(self.constrs_target_size)
+        if control_size is None:
+            return
+        # Only d[j,0] and d[j,1] count as "controlled"; d[j,2] means uncontrolled
+        _sum = pmoenv.quicksum(self.d[j, k] for j in self.J for k in [0, 1])
+        if isinstance(_sum, int) and _sum == 0:
+            _sum = self.dummy_zero
+        self.add_constr_to_list(_sum == control_size, self.constrs_target_size)
+
+    def get_control(self) -> Control:
+        ctrl_dict = dict()
+        for j in self.J:
+            if pmoenv.value(self.d[j, 0]) > 0.5:
+                ctrl_dict[j] = 0
+            elif pmoenv.value(self.d[j, 1]) > 0.5:
+                ctrl_dict[j] = 1
+        return Control(ctrl_dict)
+
+    def make_constr_exclusivity(self):
+        """Exactly one of {d[j,0], d[j,1], d[j,2]} equals 1 for each j."""
+        self.clear_constr_list(self.constrs_exclusivity)
+        for j in self.J:
+            self.add_constr_to_list(
+                self.d[j, 0] + self.d[j, 1] + self.d[j, 2] == 1,
+                self.constrs_exclusivity,
+            )
+
+    def append_minimality_cut(self, ctrl: Control):
+        """Forbid this exact control: at least one currently-fixed gene must change."""
+        _sum = pmoenv.quicksum((1 - self.d[j, k]) for j, k in ctrl.items())
+        if isinstance(_sum, int) and _sum == 0:
+            _sum = self.dummy_zero
+        self.add_constr_to_list(_sum >= 1, self.constrs_minimality)
+        return (EnumCutType.MINIMALITY, len(ctrl))
 
 
 class AttractorDetectionIP(MasterControlIP):
@@ -906,6 +982,7 @@ Model = TypeVar(
     "Model",
     CoreIP,
     MasterControlIP,
+    InterdictMasterControlIP,
     AttractorDetectionIP,
     ExtendedAttractorDetectionIP,
     AggregatedAttractorDetectionIP,
