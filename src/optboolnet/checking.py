@@ -163,16 +163,20 @@ def _parse_loop_length(output):
     """Return the number of states in the loop section of a NuSMV counterexample.
 
     NuSMV marks the start of the loop with '-- Loop starts here --'.
-    Returns None if no loop marker is found.
+    Falls back to the total state count in the trace if no loop marker is found
+    (e.g. fixed-point attractors where NuSMV omits the marker).
     """
     in_loop = False
-    count = 0
+    loop_count = 0
+    total_count = 0
     for line in output.split("\n"):
         if "Loop starts here" in line:
             in_loop = True
-        elif in_loop and "-> State:" in line:
-            count += 1
-    return count if count > 0 else None
+        elif "-> State:" in line:
+            total_count += 1
+            if in_loop:
+                loop_count += 1
+    return loop_count if loop_count > 0 else (total_count if total_count > 0 else None)
 
 
 def nusmv_check_attractor(
@@ -214,6 +218,11 @@ def nusmv_check_phenotype_full(bn, control=None, update_mode="synchronous", smvf
     Like nusmv_check_phenotype but also returns the cycle length of the
     counterexample attractor when the check fails.
 
+    Uses LTLSPEC F G <phenotype> instead of CTLSPEC EF AG <phenotype>.
+    For synchronous (deterministic) BNs the two are logically equivalent,
+    but LTL counterexamples are guaranteed to be lassos with a
+    '-- Loop starts here --' marker, making the attractor length parseable.
+
     Returns:
         (ok, loop_len): ok is True iff all attractors satisfy the phenotype;
         loop_len is the attractor cycle length from the counterexample trace,
@@ -221,11 +230,11 @@ def nusmv_check_phenotype_full(bn, control=None, update_mode="synchronous", smvf
 
     bn: CNFBooleanNetwork
     control: Control
-    update_mode: synchronous, asynchronous, general
+    update_mode: synchronous (recommended), asynchronous, general
     smvfile: if None, uses a temporary file
     """
     nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
-    nusmv_input += f"CTLSPEC EF AG {_sanitize_smv_expr(bn.phenotype)};"
+    nusmv_input += f"LTLSPEC F G {_sanitize_smv_expr(bn.phenotype)};"
     output = _nusmv_run(nusmv_input, smvfile, with_counterexample=True)
     ok = all(
         line.split()[-1] == "true"
