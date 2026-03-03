@@ -63,6 +63,46 @@ def make_solution_count(df: pd.DataFrame) -> pd.DataFrame:
     return tbl
 
 
+def make_solution_count_bold(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame:
+    """
+    Same pivot as make_solution_count, but cells where the top level was
+    finished are marked (*) (e.g. 12*).  Unfinished or missing cells
+    are plain strings.  Requires 'level_finished' column in ct.
+    """
+    base = make_solution_count(df)
+
+    if "level_finished" not in ct.columns:
+        return base
+
+    # For each (experiment, inst): was the highest-numbered level finished?
+    top = (
+        ct.sort_values("level")
+        .groupby(["experiment", "inst"])
+        .last()
+        .reset_index()
+        [["experiment", "inst", "level_finished"]]
+    )
+    finished_pairs = set(
+        zip(
+            top.loc[top["level_finished"], "experiment"],
+            top.loc[top["level_finished"], "inst"],
+        )
+    )
+
+    out = base.copy().astype(object)
+    for (_, experiment), row in base.iterrows():
+        for inst in base.columns:
+            val = row[inst]
+            if pd.isna(val):
+                out.loc[(_, experiment), inst] = ""
+            else:
+                cell = str(int(round(val)))
+                if (experiment, inst) in finished_pairs:
+                    cell = f"{cell}*"
+                out.loc[(_, experiment), inst] = cell
+    return out
+
+
 def make_completion_time(ct: pd.DataFrame, variant: str | None) -> pd.DataFrame:
     ct = ct.copy()
     if variant:
@@ -176,10 +216,11 @@ def main() -> None:
     ct = pd.read_csv(os.path.join(rd, "completion_time.csv"))
 
     tables = {
-        "agg_solution_count": make_solution_count(df),
-        "agg_completion_time": make_completion_time(ct, args.variant),
-        "agg_cuts_total": make_cuts_table(df, args.variant, "count_cuts"),
-        "agg_cuts_avg": make_cuts_table(df, args.variant, "avg_cuts"),
+        "agg_solution_count":      make_solution_count(df),
+        "agg_solution_count_bold": make_solution_count_bold(df, ct),
+        "agg_completion_time":     make_completion_time(ct, args.variant),
+        "agg_cuts_total":          make_cuts_table(df, args.variant, "count_cuts"),
+        "agg_cuts_avg":            make_cuts_table(df, args.variant, "avg_cuts"),
     }
 
     print(f"Writing tables to '{rd}':")
