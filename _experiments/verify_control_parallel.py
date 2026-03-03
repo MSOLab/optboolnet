@@ -43,7 +43,7 @@ def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int]
 
 
 # ---------------------------------------------------------------------------
-# Main-process result cache (persists across all work_dirs in a single run)
+# Main-process result cache (persists for the full run across all work_dirs)
 # Key: (inst_name, ctrl_key)  Value: ok (bool only — elapsed is not stored)
 # ---------------------------------------------------------------------------
 
@@ -78,7 +78,8 @@ def _log_result(
     if ok:
         line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
     else:
-        print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s)")
+        tag = os.path.basename(work_dir)
+        print(f"\tincorrect [{tag}/{inst}] {ctrl} ({elapsed:.1f}s)")
         line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
@@ -86,33 +87,21 @@ def _log_result(
 
 def _log_instance_done(output_file: str, work_dir: str, inst: str):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\t[{inst}] done ({ts})")
+    tag = os.path.basename(work_dir)
+    print(f"\t[{tag}/{inst}] done ({ts})")
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(f"{work_dir},{inst},DONE,{ts}\n")
 
 
-# ---------------------------------------------------------------------------
-# Core
-# ---------------------------------------------------------------------------
-
-
-def verify_work_dir(
-    work_dir: str, output_file: str, instances: List[str], workers: int
-) -> List[Tuple[str, str, Control]]:
-    """
-    Verify controls from sol.json using fast CTL model checking.
-
-    Returns a list of (work_dir, inst, ctrl) for every control that failed
-    the phenotype check — these can be passed to get_loop_lengths() later.
-    """
-    print(work_dir)
-
-    all_pairs: List[Tuple[str, Control]] = []
-    inst_counts: Dict[str, int] = {}
+def _collect_pairs(
+    work_dir: str, instances: List[str], output_file: str
+) -> List[Tuple[str, Control]]:
+    """Read sol.json for each instance and return (inst, ctrl) pairs."""
+    pairs: List[Tuple[str, Control]] = []
     for inst in instances:
         sol_path = _find_sol_path(work_dir, inst)
         if sol_path is None:
-            print(f"\t{inst}: sol.json not found, skipping")
+            print(f"\t{os.path.basename(work_dir)}/{inst}: sol.json not found, skipping")
             with open(output_file, "a", encoding="utf-8") as _f:
                 _f.write(f"{work_dir},{inst},MISSING\n")
             continue
@@ -121,31 +110,63 @@ def verify_work_dir(
             for sol_list in json.load(_f).values():
                 for sol in sol_list:
                     ctrl_list.append(Control(sol))
-        inst_counts[inst] = len(ctrl_list)
-        all_pairs.extend((inst, ctrl) for ctrl in ctrl_list)
-        print(f"\t{inst}: {len(ctrl_list)} controls")
+        pairs.extend((inst, ctrl) for ctrl in ctrl_list)
+        print(f"\t{os.path.basename(work_dir)}/{inst}: {len(ctrl_list)} controls")
+    return pairs
 
-    total = len(all_pairs)
+
+# ---------------------------------------------------------------------------
+# Core — single pool across all work_dirs
+# ---------------------------------------------------------------------------
+
+
+def verify_all(
+    work_dir_list: List[str], output_file: str, instances: List[str], workers: int
+) -> List[Tuple[str, str, Control]]:
+    """
+    Verify controls from all work_dirs using a single shared worker pool.
+
+    All (work_dir, inst, ctrl) triplets from every experiment are submitted at
+    once so workers are never idle waiting for one slow experiment to finish
+    before the next starts.
+
+    Returns a list of (work_dir, inst, ctrl) for every control that failed
+    the phenotype check — pass these to get_loop_lengths() for LTL analysis.
+    """
+    # Phase 1: collect all triplets upfront (sol.json reads are fast).
+    # wdi = (work_dir, inst) key used for per-instance progress and DONE logging.
+    all_triplets: List[Tuple[str, str, Control]] = []
+    wdi_counts: Dict[Tuple[str, str], int] = {}
+
+    for work_dir in work_dir_list:
+        pairs = _collect_pairs(work_dir, instances, output_file)
+        for inst, ctrl in pairs:
+            wdi = (work_dir, inst)
+            wdi_counts[wdi] = wdi_counts.get(wdi, 0) + 1
+            all_triplets.append((work_dir, inst, ctrl))
+
+    total = len(all_triplets)
     if total == 0:
         return []
 
-    # Split into cached and to-run.
-    to_run: List[Tuple[str, Control, tuple]] = []
-    for inst, ctrl in all_pairs:
+    # Phase 2: split cached vs to-run.
+    to_run: List[Tuple[str, str, Control, tuple]] = []
+    for work_dir, inst, ctrl in all_triplets:
         key = (inst, _ctrl_key(ctrl))
         if key not in _result_cache:
-            to_run.append((inst, ctrl, key))
+            to_run.append((work_dir, inst, ctrl, key))
 
     n_cached = total - len(to_run)
+    n_wds = len({wd for wd, _, _ in all_triplets})
     print(
-        f"\tTotal: {total} checks ({n_cached} cached, {len(to_run)} to compute)"
-        f" across {len(inst_counts)} instance(s), {workers} workers"
+        f"Total: {total} checks ({n_cached} cached, {len(to_run)} to compute)"
+        f" across {n_wds} experiment(s), {workers} workers"
     )
 
     incorrect: List[Tuple[str, str, Control]] = []
 
-    # Flush cached results immediately (elapsed logged as 0.0s).
-    for inst, ctrl in all_pairs:
+    # Flush cached results (elapsed = 0.0s).
+    for work_dir, inst, ctrl in all_triplets:
         key = (inst, _ctrl_key(ctrl))
         if key in _result_cache:
             ok = _result_cache[key]
@@ -153,27 +174,29 @@ def verify_work_dir(
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
 
-    # Instances with no non-cached controls are fully done after the cache flush.
-    inst_to_run_count: Dict[str, int] = {}
-    for inst, ctrl, key in to_run:
-        inst_to_run_count[inst] = inst_to_run_count.get(inst, 0) + 1
-    for inst in inst_counts:
-        if inst not in inst_to_run_count:
-            _log_instance_done(output_file, work_dir, inst)
+    # Mark (work_dir, inst) pairs that are fully covered by cache as done now.
+    wdi_to_run_count: Dict[Tuple[str, str], int] = {}
+    for work_dir, inst, ctrl, key in to_run:
+        wdi = (work_dir, inst)
+        wdi_to_run_count[wdi] = wdi_to_run_count.get(wdi, 0) + 1
+    for wdi in wdi_counts:
+        if wdi not in wdi_to_run_count:
+            _log_instance_done(output_file, wdi[0], wdi[1])
 
     if not to_run:
         return incorrect
 
-    completed_by_inst = {inst: 0 for inst in inst_to_run_count}
-    last_pct_by_inst = {inst: 0 for inst in inst_to_run_count}
+    # Phase 3: single pool for all non-cached triplets across all experiments.
+    wdi_completed: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
+    last_pct_by_wdi: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_check_ctrl_for_inst, inst, ctrl): (inst, ctrl, key)
-            for inst, ctrl, key in to_run
+            executor.submit(_check_ctrl_for_inst, inst, ctrl): (work_dir, inst, ctrl, key)
+            for work_dir, inst, ctrl, key in to_run
         }
         for future in as_completed(futures):
-            inst, ctrl, key = futures[future]
+            work_dir, inst, ctrl, key = futures[future]
             ok, elapsed = future.result()
 
             _result_cache[key] = ok
@@ -181,20 +204,27 @@ def verify_work_dir(
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
 
-            completed_by_inst[inst] += 1
-            n = inst_to_run_count[inst]
-            c = completed_by_inst[inst]
+            wdi = (work_dir, inst)
+            wdi_completed[wdi] += 1
+            n = wdi_to_run_count[wdi]
+            c = wdi_completed[wdi]
 
             pct = c * 100 // n
             milestone = pct // 10 * 10
-            if milestone > last_pct_by_inst[inst]:
-                print(f"\t[{inst}] {milestone}% ({c}/{n})")
-                last_pct_by_inst[inst] = milestone
+            if milestone > last_pct_by_wdi[wdi]:
+                tag = os.path.basename(work_dir)
+                print(f"\t[{tag}/{inst}] {milestone}% ({c}/{n})")
+                last_pct_by_wdi[wdi] = milestone
 
             if c == n:
                 _log_instance_done(output_file, work_dir, inst)
 
     return incorrect
+
+
+# ---------------------------------------------------------------------------
+# LTL counterexample analysis (separate pass on incorrect controls)
+# ---------------------------------------------------------------------------
 
 
 def get_loop_lengths(
@@ -209,7 +239,7 @@ def get_loop_lengths(
     Results are appended to output_file as:
         work_dir,inst,ctrl,LOOP_LEN,<n>,<elapsed>s
 
-    Intended to be called after verify_work_dir() on the returned incorrect list.
+    Intended to be called after verify_all() on the returned incorrect list.
     """
     if not incorrect_pairs:
         return
@@ -222,7 +252,8 @@ def get_loop_lengths(
         for future in as_completed(futures):
             work_dir, inst, ctrl = futures[future]
             loop_len, elapsed = future.result()
-            print(f"\t[{inst}] {ctrl} -> loop={loop_len} ({elapsed:.1f}s)")
+            tag = os.path.basename(work_dir)
+            print(f"\t[{tag}/{inst}] {ctrl} -> loop={loop_len} ({elapsed:.1f}s)")
             with open(output_file, "a", encoding="utf-8") as _f:
                 _f.write(
                     f"{work_dir},{inst},{ctrl},LOOP_LEN,{loop_len},{elapsed:.1f}s\n"
@@ -236,7 +267,7 @@ def get_loop_lengths(
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
-            "Verify controls from sol.json in parallel: "
+            "Verify controls from sol.json in parallel across all experiments: "
             "check all attractors satisfy the phenotype."
         )
     )
@@ -298,14 +329,11 @@ if __name__ == "__main__":
                 for algo in _ALGO_SUBDIRS
             )
         ]
-        print(f"Found {len(work_dir_list)} work dir(s) under {root_dir}:")
+        print(f"Found {len(work_dir_list)} experiment(s) under {root_dir}:")
         for d in work_dir_list:
             print(f"  {d}")
 
-    all_incorrect: List[Tuple[str, str, Control]] = []
-    for work_dir in work_dir_list:
-        incorrect = verify_work_dir(work_dir, args.output, args.instances, args.workers)
-        all_incorrect.extend(incorrect)
+    all_incorrect = verify_all(work_dir_list, args.output, args.instances, args.workers)
 
     # Call get_loop_lengths(all_incorrect, args.output, args.workers) here
     # to run LTL counterexample analysis on the incorrect controls.
