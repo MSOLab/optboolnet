@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List
 
@@ -12,18 +13,19 @@ from optboolnet.instances import load_bn_in_repo, _INSTANCE_LIST_FULL
 
 _ALGO_SUBDIRS = ["benders", "MibS"]
 
-# Per-worker global: loaded once per process via _init_worker
-_worker_bn = None
+# Per-worker BN cache: {inst_name: bn}. Persists for the lifetime of each
+# worker process so each BN is loaded at most once per worker.
+_worker_bns = {}
 
 
-def _init_worker(inst_name: str):
-    global _worker_bn
-    _worker_bn = load_bn_in_repo(inst_name)
-
-
-def _check_ctrl(ctrl: Control):
-    ok = nusmv_check_phenotype(_worker_bn, control=ctrl)
-    return ctrl, ok
+def _check_ctrl_for_inst(inst_name: str, ctrl: Control):
+    if inst_name not in _worker_bns:
+        _worker_bns[inst_name] = load_bn_in_repo(inst_name)
+    bn = _worker_bns[inst_name]
+    t0 = time.perf_counter()
+    ok = nusmv_check_phenotype(bn, control=ctrl)
+    elapsed = time.perf_counter() - t0
+    return inst_name, ctrl, ok, elapsed
 
 
 def _find_sol_path(work_dir: str, inst: str):
@@ -36,6 +38,12 @@ def _find_sol_path(work_dir: str, inst: str):
 
 def verify_work_dir(work_dir: str, output_file: str, instances: List[str], workers: int):
     print(work_dir)
+
+    # Collect all (inst, ctrl) pairs across every instance up front so that a
+    # single pool can draw from all of them and CPU stays fully utilised even
+    # when one instance has fewer controls than the number of workers.
+    all_pairs: List[tuple] = []
+    inst_counts = {}
     for inst in instances:
         sol_path = _find_sol_path(work_dir, inst)
         if sol_path is None:
@@ -43,44 +51,45 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
             with open(output_file, "a", encoding="utf-8") as _f:
                 _f.write(f"{work_dir},{inst},MISSING\n")
             continue
-        print(inst)
         ctrl_list: List[Control] = []
         with open(sol_path, "r") as _f:
             for sol_list in json.load(_f).values():
                 for sol in sol_list:
                     ctrl_list.append(Control(sol))
+        inst_counts[inst] = len(ctrl_list)
+        all_pairs.extend((inst, ctrl) for ctrl in ctrl_list)
+        print(f"\t{inst}: {len(ctrl_list)} controls")
 
-        n = len(ctrl_list)
-        print(f"\t{n} controls, {workers} workers")
+    total = len(all_pairs)
+    if total == 0:
+        return
+    print(f"\tTotal: {total} checks across {len(inst_counts)} instance(s), {workers} workers")
 
-        incorrect = []
-        completed = 0
-        last_pct = 0
+    completed_by_inst = {inst: 0 for inst in inst_counts}
+    last_pct_by_inst = {inst: 0 for inst in inst_counts}
 
-        # Each worker process loads bn once via _init_worker; ctrl items are
-        # distributed across workers and checked concurrently.
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(inst,),
-        ) as executor:
-            futures = {executor.submit(_check_ctrl, ctrl): ctrl for ctrl in ctrl_list}
-            for future in as_completed(futures):
-                ctrl, ok = future.result()
-                completed += 1
-                if not ok:
-                    incorrect.append(ctrl)
-                    print(f"\tincorrect: {ctrl}")
-                pct = completed * 100 // n
-                milestone = pct // 10 * 10
-                if milestone > last_pct:
-                    print(f"\t{milestone}% ({completed}/{n})")
-                    last_pct = milestone
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_check_ctrl_for_inst, inst, ctrl): (inst, ctrl)
+            for inst, ctrl in all_pairs
+        }
+        for future in as_completed(futures):
+            inst, ctrl, ok, elapsed = future.result()
+            completed_by_inst[inst] += 1
 
-        if incorrect:
-            with open(output_file, "a", encoding="utf-8") as _f:
-                for ctrl in incorrect:
-                    _f.write(f"{work_dir},{inst},{ctrl}\n")
+            if not ok:
+                print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s)")
+                with open(output_file, "a", encoding="utf-8") as _f:
+                    _f.write(f"{work_dir},{inst},{ctrl},{elapsed:.1f}s\n")
+
+            # Per-instance progress milestones
+            n = inst_counts[inst]
+            c = completed_by_inst[inst]
+            pct = c * 100 // n
+            milestone = pct // 10 * 10
+            if milestone > last_pct_by_inst[inst]:
+                print(f"\t[{inst}] {milestone}% ({c}/{n})")
+                last_pct_by_inst[inst] = milestone
 
 
 if __name__ == "__main__":
