@@ -27,12 +27,49 @@ class PrintIter(Iterator):
             return value
 
 
-def _run_mibs(model: MasterControlIP) -> bool:
+def _save_bilevel_model(model: MasterControlIP, path: str) -> None:
+    """Write a human-readable dump of the bilevel model.
+
+    Produces two files:
+      <path>         – ULP written as an LP file with symbolic variable names.
+      <stem>_llp.txt – LLP variables and constraints as plain text.
+
+    The LLP is dumped separately because Pyomo's LP writer does not support
+    PAO SubModel blocks.
+    """
+    stem = path.rsplit(".", 1)[0] if "." in path else path
+
+    # --- ULP as LP (deactivate LLP so the LP writer doesn't see SubModel) ---
+    model.LLP.deactivate()
+    try:
+        model.write(path, io_options={"symbolic_solver_labels": True})
+    finally:
+        model.LLP.activate()
+
+    # --- LLP as text dump ---
+    llp_path = stem + "_llp.txt"
+    with open(llp_path, "w") as f:
+        f.write("=== LLP VARIABLES ===\n")
+        for var in model.LLP.component_data_objects(pmoenv.Var, active=True):
+            lb = var.lb if var.lb is not None else "-inf"
+            ub = var.ub if var.ub is not None else "+inf"
+            f.write(f"  {var.name}  [{lb}, {ub}]\n")
+
+        f.write("\n=== LLP CONSTRAINTS ===\n")
+        for constr in model.LLP.component_data_objects(pmoenv.Constraint, active=True):
+            f.write(f"  {constr.name}:  {constr.expr}\n")
+
+
+def _run_mibs(model: MasterControlIP, extra_options: Optional[Dict[str, int]] = None) -> bool:
     """Shared MibS solve routine for bilevel models.
 
     Reads the pre-computed time limit from model.solver.options (set by
     AttractorControl._optimize → update_options_time_limit) and passes it
     as -Alps_timeLimit so MibS stops cleanly within the wall-clock budget.
+
+    Args:
+        extra_options: Additional MibS parameters passed as command-line flags,
+            e.g. {"MibS_bilevelProblemType": 1, "MibS_useBendersInterdictionCut": 1}.
     """
     pyomo_solver = Solver("pao.pyomo.MIBS")
     with Solver("pao.mpr.MIBS") as mpr_solver:
@@ -40,19 +77,35 @@ def _run_mibs(model: MasterControlIP) -> bool:
         lmp, soln_manager = convert_pyomo2MultilevelProblem(model)
         results = PyomoSubmodelResults(solution_manager=soln_manager)
 
+        # Optional: write a human-readable model dump before PAO strips variable names.
+        # Activated by setting solver_config.save_lp_path to a file path (any extension).
+        # Produces two files:
+        #   <path>           – ULP written as LP with symbolic names
+        #   <stem>_llp.txt   – LLP variables and constraints as a text dump
+        save_lp_path = getattr(model.solver_config, "save_lp_path", None)
+        if save_lp_path:
+            _save_bilevel_model(model, save_lp_path)
+
         temp_mps, temp_aux = "mibs_temp.mps", "mibs_temp.aux"
         mpr_solver.create_mibs_model(lmp, temp_mps, temp_aux)
 
         # Build MibS command; pass remaining wall-clock time as an internal limit
         # so MibS can report partial results before the process is killed externally.
         cmd = [model.solver_config.executable, "-Alps_instance", temp_mps]
+        if extra_options:
+            for key, val in extra_options.items():
+                cmd += [f"-{key}", str(val)]
         time_limit = model.solver.options.get("time_limit", None)
         if time_limit is not None:
             cmd += ["-Alps_timeLimit", str(int(max(1, time_limit)))]
 
         ans = run_shellcmd(cmd, tee=model.solver_config.tee, time_limit=time_limit)
-        os.remove(temp_mps)
-        os.remove(temp_aux)
+
+        # Optional: keep temp files for post-mortem inspection.
+        # Activated by setting solver_config.keep_temp = True.
+        if not getattr(model.solver_config, "keep_temp", False):
+            os.remove(temp_mps)
+            os.remove(temp_aux)
 
         line_iter = PrintIter(iter(ans["log"].split("\r\n")))
         _line = next(line_iter)
@@ -390,6 +443,213 @@ class MibSAggBilevelIP(MasterControlIP):
         return _run_mibs(self)
 
 
+class MibSInterdictBilevelIP(MasterControlIP):
+    """Explicit interdiction bilevel model (max-min formulation).
+
+    Follows the interdiction formulation in the IJOC paper:
+
+        max_{d}  min_{delta, x, y, w, phi, p}  p
+
+    The upper level selects a control d (which genes to fix and to what value).
+    The lower level finds the attractor (of length up to T_max) that minimises
+    the phenotype indicator p.  Coupling between levels is achieved through
+    auxiliary interdiction variables delta^k_j satisfying delta^k_j <= 1 - d^k_j,
+    so d^k_j = 1 forces delta^k_j = 0 and activates the corresponding gene constraint.
+
+    For MibS, pass the extra options:
+        MibS_bilevelProblemType       = 1
+        MibS_objBoundStrategy         = 1
+        MibS_useBendersInterdictionCut = 1
+    """
+
+    #: Extra MibS command-line options required for the interdiction problem type.
+    MIBS_INTERDICTION_OPTIONS: Dict[str, int] = {
+        "MibS_bilevelProblemType": 1,
+        "MibS_objBoundStrategy": 1,
+        "MibS_useBendersInterdictionCut": 1,
+    }
+
+    def __init__(
+        self,
+        name: str,
+        bn: CNFBooleanNetwork,
+        length: int,
+        solver_config: SolverMibSConfig,
+        *args,
+        **kwds,
+    ):
+        super().__init__(name, bn, solver_config, *args, **kwds)
+        self.solver_config = solver_config
+        self.length = length
+
+        # ---- index sets ----
+        self.T_range = pmoenv.Set(initialize=range(1, 1 + length))
+        """Time positions 1..T_max"""
+        self.T_range_0 = pmoenv.Set(initialize=range(0, 1 + length))
+        """Time positions 0..T_max; t=0 is the periodicity reference for y"""
+
+        # ---- ULP objective: maximise p (minimise -p where p is an LLP var) ----
+        # For MibS interdiction (bilevelProblemType=1) the ULP objective must equal
+        # the LLP objective.  We declare the LLP first so we can reference LLP.p.
+        self.LLP = SubModel(fixed=[self.d])
+
+        # ---- LLP variables ----
+        self.LLP.delta = pmoenv.Var(self.J * self.B, domain=pmoenv.Binary)
+        """delta[j,k]=1 auxiliary interdiction variable for k in {0,1}"""
+        self.LLP.delta_star = pmoenv.Var(self.J, domain=pmoenv.Binary)
+        """delta_star[j] auxiliary interdiction variable for k=* (uncontrolled)"""
+        self.LLP.x = pmoenv.Var(self.I * self.T_range, domain=pmoenv.Binary)
+        """x[i,t] = state of gene i at time t"""
+        self.LLP.y = pmoenv.Var(self.C * self.T_range_0, domain=pmoenv.Binary)
+        """y[i,c,t] = truth value of clause c of gene i at time t;
+        y[i,c,0] is the periodicity reference (= y[i,c,T*])"""
+        self.LLP.p = pmoenv.ScalarVar(domain=pmoenv.Binary)
+        """p = 1 iff every active time step satisfies the phenotype"""
+        self.LLP.w = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
+        """w[t] = 1 iff the selected attractor length is exactly t"""
+        self.LLP.phi = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
+        """phi[t] = 1 iff time t is active AND the phenotype is violated at t"""
+
+        # ULP objective: minimise -p  ≡  maximise p  (interdiction structure)
+        self.obj = pmoenv.Objective(expr=-self.LLP.p, sense=pmoenv.minimize)
+
+        # ---- ULP linking constraints (interdict): delta^k_j <= 1 - d^k_j ----
+        # These are ULP constraints that reference LLP variables (standard in PAO).
+        self.constrs_interdict = pmoenv.ConstraintList()
+        for j in self.J:
+            # delta^0_j <= 1 - d^0_j
+            self.constrs_interdict.add(self.LLP.delta[j, 0] <= 1 - self.d[j, 0])
+            # delta^1_j <= 1 - d^1_j
+            self.constrs_interdict.add(self.LLP.delta[j, 1] <= 1 - self.d[j, 1])
+            # delta^*_j <= 1 - d^*_j = d^0_j + d^1_j  (since d^* = 1 - d^0 - d^1)
+            self.constrs_interdict.add(
+                self.LLP.delta_star[j] <= self.d[j, 0] + self.d[j, 1]
+            )
+
+        # ---- LLP constraints ----
+        self.LLP.constrs_phenotype = pmoenv.ConstraintList()
+        self.LLP.constrs_stability = pmoenv.ConstraintList()
+        self.LLP.constrs_periodicity = pmoenv.ConstraintList()
+
+        # (w-sum) sum_t w[t] = 1  →  exactly one attractor length is selected
+        self.LLP.constrs_phenotype.add(pmoenv.summation(self.LLP.w) == 1)
+
+        # (wrap) -(1-w[t]) <= y[c,0] - y[c,t] <= (1-w[t])  for all c, t
+        # When w[T]=1 this enforces y[c,0] = y[c,T] (periodicity).
+        for (i, c) in self.C:
+            for t in self.T_range:
+                self.LLP.constrs_periodicity.add(
+                    self.LLP.y[i, c, 0] - self.LLP.y[i, c, t] <= 1 - self.LLP.w[t]
+                )
+                self.LLP.constrs_periodicity.add(
+                    self.LLP.y[i, c, t] - self.LLP.y[i, c, 0] <= 1 - self.LLP.w[t]
+                )
+
+        # (ph-lin) phi[t] = (sum_{t'>=t} w[t']) AND (1 - x[phi, t])
+        # Linearised as three inequalities; sum_{t'>=t} w[t'] acts as activity mask.
+        for t in self.T_range:
+            o_t = pmoenv.quicksum(self.LLP.w[t_] for t_ in self.T_range if t_ >= t)
+            self.LLP.constrs_phenotype.add(self.LLP.phi[t] <= o_t)
+            self.LLP.constrs_phenotype.add(
+                self.LLP.phi[t] <= 1 - self.LLP.x[self.bn.phenotype, t]
+            )
+            self.LLP.constrs_phenotype.add(
+                self.LLP.phi[t] >= o_t - self.LLP.x[self.bn.phenotype, t]
+            )
+
+        # (ph) p constraints
+        # p <= (1/T_max) * sum_t (1 - phi[t])   (upper bound; strengthens LP relaxation)
+        self.LLP.constrs_phenotype.add(
+            self.LLP.p
+            <= pmoenv.quicksum(1 - self.LLP.phi[t] for t in self.T_range) / self.length
+        )
+        # p >= 1 - sum_t phi[t]   (p=0 whenever any active time violates phenotype)
+        self.LLP.constrs_phenotype.add(
+            self.LLP.p >= 1 - pmoenv.summation(self.LLP.phi)
+        )
+
+        # (con-1), (con-2), (fix) for controllable genes j in J
+        for j in self.J:
+            for t in self.T_range:
+                t_prev = t - 1  # y[j,c,0] at t=1 is the periodicity reference
+
+                # (fix) x[j,t] <= delta^0_j   AND   x[j,t] >= 1 - delta^1_j
+                self.LLP.constrs_stability.add(
+                    self.LLP.x[j, t] <= self.LLP.delta[j, 0]
+                )
+                self.LLP.constrs_stability.add(
+                    self.LLP.x[j, t] >= 1 - self.LLP.delta[j, 1]
+                )
+
+                # (con-1) x[j,t] <= y[c,t-1] + delta^*_j  for each c in C_j
+                for c in self.C_i[j]:
+                    self.LLP.constrs_stability.add(
+                        self.LLP.x[j, t]
+                        <= self.LLP.y[j, c, t_prev] + self.LLP.delta_star[j]
+                    )
+
+                # (con-2) x[j,t] >= 1 - sum_c (1-y[c,t-1]) - delta^*_j
+                self.LLP.constrs_stability.add(
+                    self.LLP.x[j, t]
+                    >= 1
+                    - pmoenv.quicksum(
+                        1 - self.LLP.y[j, c, t_prev] for c in self.C_i[j]
+                    )
+                    - self.LLP.delta_star[j]
+                )
+
+        # (uncon-1), (uncon-2) for uncontrollable genes i in J_c
+        for i in self.J_c:
+            for t in self.T_range:
+                t_prev = t - 1
+
+                # (uncon-1) x[i,t] <= y[c,t-1]  for each c in C_i
+                for c in self.C_i[i]:
+                    self.LLP.constrs_stability.add(
+                        self.LLP.x[i, t] <= self.LLP.y[i, c, t_prev]
+                    )
+
+                # (uncon-2) x[i,t] >= 1 - sum_c (1-y[c,t-1])
+                self.LLP.constrs_stability.add(
+                    self.LLP.x[i, t]
+                    >= 1
+                    - pmoenv.quicksum(
+                        1 - self.LLP.y[i, c, t_prev] for c in self.C_i[i]
+                    )
+                )
+
+        # (lit-1), (lit-2), (lit-3) clause-literal synchronisation for t in T_range
+        for (i, c), clause in self.bn.iter_clauses():
+            for t in self.T_range:
+                x_lit_list = [self.LLP.x[i_, t] for i_ in clause.pos_literals] + [
+                    1 - self.LLP.x[i_, t] for i_ in clause.neg_literals
+                ]
+                for i_ in clause.pos_literals:
+                    self.LLP.constrs_stability.add(
+                        self.LLP.y[i, c, t] >= self.LLP.x[i_, t]
+                    )
+                for i_ in clause.neg_literals:
+                    self.LLP.constrs_stability.add(
+                        self.LLP.y[i, c, t] >= 1 - self.LLP.x[i_, t]
+                    )
+                self.LLP.constrs_stability.add(
+                    self.LLP.y[i, c, t] <= sum(x_lit_list)
+                )
+
+        # Placeholder required by MibSAttractorControl (minimality cuts go here)
+        self.constrs_no_good_x = pmoenv.ConstraintList()
+
+        # LLP objective: minimise p  (leader maximises this worst-case value)
+        self.LLP.obj = pmoenv.Objective(expr=self.LLP.p, sense=pmoenv.minimize)
+
+    def not_allow_empty_attractor(self):
+        """No-op: the interdiction LLP always selects an attractor via sum(w)=1."""
+        pass
+
+    def optimize(self):
+        return _run_mibs(self, self.MIBS_INTERDICTION_OPTIONS)
+
+
 class MibSAttractorControl(AttractorControl):
     def __init__(
         self,
@@ -410,7 +670,12 @@ class MibSAttractorControl(AttractorControl):
         self.max_control_size = _config.max_control_size
         self.max_length = _config.max_length
 
-        _model_cls = MibSAggBilevelIP if _config.use_aggregated_LLP else MibSBilevelIP
+        if _config.use_interdiction:
+            _model_cls = MibSInterdictBilevelIP
+        elif _config.use_aggregated_LLP:
+            _model_cls = MibSAggBilevelIP
+        else:
+            _model_cls = MibSBilevelIP
         self.model_bilevel = self._build_model(
             _model_cls, name, bn, _config.max_length, _config.solver_config
         )

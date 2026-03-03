@@ -183,6 +183,10 @@ class MibSBilevelConfig(AttractorControlConfig):
     use_valid_cuts: bool
     use_aggregated_LLP: bool = False
     """If true, use MibSAggBilevelIP (aggregated single LLP) instead of MibSBilevelIP (extensive form)."""
+    use_interdiction: bool = False
+    """If true, use MibSInterdictBilevelIP (explicit interdiction formulation).
+    Requires passing MibS_bilevelProblemType=1, MibS_objBoundStrategy=1,
+    MibS_useBendersInterdictionCut=1 to the MibS solver."""
     solver_config: SolverConfig
 
 
