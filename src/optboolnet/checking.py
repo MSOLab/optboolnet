@@ -1,12 +1,54 @@
 import os
+import re
 import tempfile
 from nusmv import NuSMV
+
+# NuSMV reserved keywords that cannot be used as variable identifiers.
+# Variables whose names collide are prefixed with "v" (e.g. MAX -> vMAX).
+_NUSMV_RESERVED = frozenset({
+    # Module-level
+    "MODULE", "DEFINE", "MDEFINE", "CONSTANTS", "VAR", "IVAR", "FROZENVAR",
+    "ASSIGN", "TRANS", "INIT", "INVAR", "SPEC", "CTLSPEC", "LTLSPEC",
+    "PSLSPEC", "COMPUTE", "INVARSPEC", "FAIRNESS", "JUSTICE", "COMPASSION",
+    "ISA", "CONSTRAINT", "SIMPWFF", "CTLWFF", "LTLWFF", "PSLWFF", "COMPWFF",
+    # COMPUTE operators (most likely to appear as bio variable names)
+    "MAX", "MIN",
+    # Set / type operators
+    "IN", "UNION",
+    # Types
+    "BOOLEAN", "INTEGER", "REAL", "WORD", "WORD1", "BOOL",
+    "SIGNED", "UNSIGNED", "ARRAY", "OF",
+    # Built-in functions
+    "COUNT", "EXTEND", "RESIZE", "SIZEOF", "TOINT", "SWCONST",
+    # Case expression
+    "CASE", "ESAC",
+    # Temporal / path
+    "NEXT", "SELF", "PROCESS",
+    # Boolean literals
+    "TRUE", "FALSE",
+    # CTL / LTL single-letter operators that NuSMV reserves
+    "EBF", "EBG", "ABF", "ABG",
+    # Lowercase variants that NuSMV also reserves
+    "mod", "union", "in", "xor", "xnor", "case", "esac", "next", "init",
+    "process", "array", "of", "boolean", "integer", "real", "word", "self",
+    "count", "extend", "resize", "sizeof", "toint", "signed", "unsigned",
+})
 
 
 def _nusmv_var(n):
     if isinstance(n, int):
         return "x%d" % n
-    return n
+    s = str(n)
+    return ("v" + s) if s in _NUSMV_RESERVED else s
+
+
+def _sanitize_smv_expr(expr):
+    """Replace reserved NuSMV keywords used as identifiers in a string expression."""
+    return re.sub(
+        r'\b([A-Za-z_][A-Za-z0-9_]*)\b',
+        lambda m: ("v" + m.group(1)) if m.group(1) in _NUSMV_RESERVED else m.group(1),
+        expr,
+    )
 
 
 def _nusmv_model(bn, control=None, update_mode="synchronous"):
@@ -132,5 +174,5 @@ def nusmv_check_phenotype(bn, control=None, update_mode="synchronous", smvfile=N
     smvfile: if None, uses a temporary file
     """
     nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
-    nusmv_input += f"CTLSPEC EF AG {bn.phenotype};"
+    nusmv_input += f"CTLSPEC EF AG {_sanitize_smv_expr(bn.phenotype)};"
     return _nusmv_alltrue(nusmv_input, smvfile)
