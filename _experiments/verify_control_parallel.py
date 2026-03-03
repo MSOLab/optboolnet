@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from optboolnet.boolnet import Control
-from optboolnet.checking import nusmv_check_phenotype_full
+from optboolnet.checking import nusmv_check_phenotype, nusmv_check_phenotype_full
 from optboolnet.instances import load_bn_in_repo, _INSTANCE_LIST_FULL
 
 
@@ -17,28 +17,37 @@ _ALGO_SUBDIRS = ["benders", "MibS"]
 # Per-worker state (each worker process has its own copy)
 # ---------------------------------------------------------------------------
 
-# BN cache: avoid reloading the same network within a single worker process.
 _worker_bns: dict = {}
 
 
-def _check_ctrl_for_inst(
-    inst_name: str, ctrl: Control
-) -> Tuple[bool, float, Optional[int]]:
+def _check_ctrl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, float]:
+    """CTL phenotype check — fast, no counterexample trace."""
     if inst_name not in _worker_bns:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
     t0 = time.perf_counter()
-    ok, loop_len = nusmv_check_phenotype_full(bn, control=ctrl)
+    ok = nusmv_check_phenotype(bn, control=ctrl)
     elapsed = time.perf_counter() - t0
-    return ok, elapsed, loop_len
+    return ok, elapsed
+
+
+def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int], float]:
+    """LTL phenotype check — slower, parses attractor cycle length from the trace."""
+    if inst_name not in _worker_bns:
+        _worker_bns[inst_name] = load_bn_in_repo(inst_name)
+    bn = _worker_bns[inst_name]
+    t0 = time.perf_counter()
+    _, loop_len = nusmv_check_phenotype_full(bn, control=ctrl)
+    elapsed = time.perf_counter() - t0
+    return loop_len, elapsed
 
 
 # ---------------------------------------------------------------------------
 # Main-process result cache (persists across all work_dirs in a single run)
 # ---------------------------------------------------------------------------
 
-# Key: (inst_name, ctrl_key)  Value: (ok, elapsed, loop_len)
-_result_cache: Dict[tuple, Tuple[bool, float, Optional[int]]] = {}
+# Key: (inst_name, ctrl_key)  Value: (ok, elapsed)
+_result_cache: Dict[tuple, Tuple[bool, float]] = {}
 
 
 def _ctrl_key(ctrl: Control) -> tuple:
@@ -65,13 +74,12 @@ def _log_result(
     ctrl: Control,
     ok: bool,
     elapsed: float,
-    loop_len: Optional[int],
 ):
     if ok:
         line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
     else:
-        print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s, loop={loop_len})")
-        line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s,loop={loop_len}"
+        print(f"\tincorrect [{inst}] {ctrl} ({elapsed:.1f}s)")
+        line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
 
@@ -81,10 +89,17 @@ def _log_result(
 # ---------------------------------------------------------------------------
 
 
-def verify_work_dir(work_dir: str, output_file: str, instances: List[str], workers: int):
+def verify_work_dir(
+    work_dir: str, output_file: str, instances: List[str], workers: int
+) -> List[Tuple[str, str, Control]]:
+    """
+    Verify controls from sol.json using fast CTL model checking.
+
+    Returns a list of (work_dir, inst, ctrl) for every control that failed
+    the phenotype check — these can be passed to get_loop_lengths() later.
+    """
     print(work_dir)
 
-    # Collect all (inst, ctrl) pairs across every instance up front.
     all_pairs: List[Tuple[str, Control]] = []
     inst_counts: Dict[str, int] = {}
     for inst in instances:
@@ -105,9 +120,9 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
 
     total = len(all_pairs)
     if total == 0:
-        return
+        return []
 
-    # Split into cached (already verified in a previous work_dir) and to-run.
+    # Split into cached and to-run.
     to_run: List[Tuple[str, Control, tuple]] = []
     for inst, ctrl in all_pairs:
         key = (inst, _ctrl_key(ctrl))
@@ -120,25 +135,27 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
         f" across {len(inst_counts)} instance(s), {workers} workers"
     )
 
-    # Flush cached results immediately (no NuSMV call needed).
+    incorrect: List[Tuple[str, str, Control]] = []
+
+    # Flush cached results immediately.
     for inst, ctrl in all_pairs:
         key = (inst, _ctrl_key(ctrl))
         if key in _result_cache:
-            ok, elapsed, loop_len = _result_cache[key]
-            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed, loop_len)
+            ok, elapsed = _result_cache[key]
+            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
+            if not ok:
+                incorrect.append((work_dir, inst, ctrl))
 
     if not to_run:
-        return
+        return incorrect
 
-    # Per-instance progress tracking (only counts non-cached checks).
+    # Per-instance progress tracking (non-cached checks only).
     inst_to_run_count: Dict[str, int] = {}
     for inst, ctrl, key in to_run:
         inst_to_run_count[inst] = inst_to_run_count.get(inst, 0) + 1
     completed_by_inst = {inst: 0 for inst in inst_to_run_count}
     last_pct_by_inst = {inst: 0 for inst in inst_to_run_count}
 
-    # Submit all pairs from all instances to a single pool so the CPU stays
-    # busy even when instances have unequal numbers of controls.
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(_check_ctrl_for_inst, inst, ctrl): (inst, ctrl, key)
@@ -146,10 +163,12 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
         }
         for future in as_completed(futures):
             inst, ctrl, key = futures[future]
-            ok, elapsed, loop_len = future.result()
+            ok, elapsed = future.result()
 
-            _result_cache[key] = (ok, elapsed, loop_len)
-            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed, loop_len)
+            _result_cache[key] = (ok, elapsed)
+            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
+            if not ok:
+                incorrect.append((work_dir, inst, ctrl))
 
             completed_by_inst[inst] += 1
             n = inst_to_run_count[inst]
@@ -159,6 +178,40 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str], worke
             if milestone > last_pct_by_inst[inst]:
                 print(f"\t[{inst}] {milestone}% ({c}/{n})")
                 last_pct_by_inst[inst] = milestone
+
+    return incorrect
+
+
+def get_loop_lengths(
+    incorrect_pairs: List[Tuple[str, str, Control]],
+    output_file: str,
+    workers: int,
+) -> None:
+    """
+    Run LTL model checking on a list of incorrect (work_dir, inst, ctrl) pairs
+    to determine the attractor cycle length from the counterexample trace.
+
+    Results are appended to output_file as:
+        work_dir,inst,ctrl,LOOP_LEN,<n>,<elapsed>s
+
+    Intended to be called after verify_work_dir() on the returned incorrect list.
+    """
+    if not incorrect_pairs:
+        return
+    print(f"LTL counterexample check: {len(incorrect_pairs)} controls, {workers} workers")
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_get_loop_len_for_inst, inst, ctrl): (work_dir, inst, ctrl)
+            for work_dir, inst, ctrl in incorrect_pairs
+        }
+        for future in as_completed(futures):
+            work_dir, inst, ctrl = futures[future]
+            loop_len, elapsed = future.result()
+            print(f"\t[{inst}] {ctrl} -> loop={loop_len} ({elapsed:.1f}s)")
+            with open(output_file, "a", encoding="utf-8") as _f:
+                _f.write(
+                    f"{work_dir},{inst},{ctrl},LOOP_LEN,{loop_len},{elapsed:.1f}s\n"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -234,5 +287,10 @@ if __name__ == "__main__":
         for d in work_dir_list:
             print(f"  {d}")
 
+    all_incorrect: List[Tuple[str, str, Control]] = []
     for work_dir in work_dir_list:
-        verify_work_dir(work_dir, args.output, args.instances, args.workers)
+        incorrect = verify_work_dir(work_dir, args.output, args.instances, args.workers)
+        all_incorrect.extend(incorrect)
+
+    # Call get_loop_lengths(all_incorrect, args.output, args.workers) here
+    # to run LTL counterexample analysis on the incorrect controls.
