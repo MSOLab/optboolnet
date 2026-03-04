@@ -1,7 +1,10 @@
 import argparse
+import ast
 import datetime
 import json
 import os
+import re
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -52,6 +55,106 @@ _result_cache: Dict[tuple, bool] = {}
 
 def _ctrl_key(ctrl: Control) -> tuple:
     return tuple(sorted(ctrl.items()))
+
+
+# ---------------------------------------------------------------------------
+# Persistent JSON cache  {inst -> {ctrl_json_key -> ok}}
+#
+# _checker_data mirrors the on-disk JSON so we never re-read the file on
+# every update.  All writes go through _flush_checker_json which does an
+# atomic rename, so a killed process cannot corrupt the file.
+# _checker_lock serialises updates in the (single) main process.
+# ---------------------------------------------------------------------------
+
+_checker_data: Dict[str, Dict[str, bool]] = {}
+_checker_lock = threading.Lock()
+
+
+def _ctrl_json_key(ctrl: Control) -> str:
+    """Canonical JSON string key for a Control."""
+    return json.dumps(sorted(ctrl.items()))
+
+
+def _json_key_to_cache_key(inst: str, json_key: str) -> tuple:
+    return (inst, tuple((k, v) for k, v in json.loads(json_key)))
+
+
+def _flush_checker_json(json_path: str) -> None:
+    """Atomically overwrite json_path from _checker_data."""
+    tmp = json_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_checker_data, f, indent=2)
+    os.replace(tmp, json_path)
+
+
+def load_checker_json(json_path: str) -> int:
+    """Load checker.json into _checker_data and populate _result_cache.
+
+    Returns the number of entries loaded.
+    """
+    global _checker_data
+    if not os.path.exists(json_path):
+        return 0
+    with open(json_path, "r", encoding="utf-8") as f:
+        _checker_data = json.load(f)
+    count = 0
+    for inst, ctrl_map in _checker_data.items():
+        for jk, ok in ctrl_map.items():
+            _result_cache[_json_key_to_cache_key(inst, jk)] = ok
+            count += 1
+    return count
+
+
+def update_checker_json(json_path: str, inst: str, ctrl: Control, ok: bool) -> None:
+    """Thread-safe: add one result to _checker_data and flush to disk."""
+    jk = _ctrl_json_key(ctrl)
+    with _checker_lock:
+        _checker_data.setdefault(inst, {})[jk] = ok
+        _flush_checker_json(json_path)
+
+
+def extract_from_log(log_path: str, json_path: str) -> int:
+    """Parse an existing log file and bootstrap / update checker.json.
+
+    Lines handled:
+        work_dir,inst,{ctrl_dict},OK,<elapsed>s
+        work_dir,inst,{ctrl_dict},INCORRECT,<elapsed>s
+
+    All other lines (comments, MISSING, DONE, LOOP_LEN) are silently skipped.
+    Returns the number of *new* entries added.
+    """
+    if not os.path.exists(log_path):
+        return 0
+    count = 0
+    with open(log_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # work_dir may contain backslashes but never commas, so split on
+            # the first two commas to isolate inst and the rest of the line.
+            parts = line.split(",", 2)
+            if len(parts) < 3:
+                continue
+            inst = parts[1]
+            rest = parts[2]
+            m = re.match(r"(\{[^}]*\}),(OK|INCORRECT),", rest)
+            if not m:
+                continue
+            ctrl_str, status = m.group(1), m.group(2)
+            try:
+                ctrl_dict = ast.literal_eval(ctrl_str)
+            except (ValueError, SyntaxError):
+                continue
+            jk = json.dumps(sorted(ctrl_dict.items()))
+            if jk not in _checker_data.get(inst, {}):
+                _checker_data.setdefault(inst, {})[jk] = (status == "OK")
+                # also update _result_cache so duplicates within this run are skipped
+                _result_cache[_json_key_to_cache_key(inst, jk)] = (status == "OK")
+                count += 1
+    if count:
+        _flush_checker_json(json_path)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +224,7 @@ def _collect_pairs(
 
 
 def verify_all(
-    work_dir_list: List[str], output_file: str, instances: List[str], workers: int
+    work_dir_list: List[str], output_file: str, instances: List[str], workers: int, json_path: str
 ) -> List[Tuple[str, str, Control]]:
     """
     Verify controls from all work_dirs using a single shared worker pool.
@@ -200,6 +303,7 @@ def verify_all(
             ok, elapsed = future.result()
 
             _result_cache[key] = ok
+            update_checker_json(json_path, inst, ctrl, ok)
             _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
@@ -306,7 +410,17 @@ if __name__ == "__main__":
         metavar="N",
         help=f"Number of parallel NuSMV processes (default: cpu_count={os.cpu_count()})",
     )
+    ap.add_argument(
+        "--json",
+        metavar="FILE",
+        default="_experiments/checker.json",
+        help="Persistent JSON cache for check results (default: _experiments/checker.json)",
+    )
     args = ap.parse_args()
+
+    n = load_checker_json(args.json)
+    if n:
+        print(f"Loaded {n} cached result(s) from {args.json}")
 
     _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
@@ -333,7 +447,7 @@ if __name__ == "__main__":
         for d in work_dir_list:
             print(f"  {d}")
 
-    all_incorrect = verify_all(work_dir_list, args.output, args.instances, args.workers)
+    all_incorrect = verify_all(work_dir_list, args.output, args.instances, args.workers, args.json)
 
     # Call get_loop_lengths(all_incorrect, args.output, args.workers) here
     # to run LTL counterexample analysis on the incorrect controls.
