@@ -75,6 +75,7 @@ def _run_variant(
     update_mode: str,
     nusmv_opts: Dict[str, bool],
     progress_every: int,
+    preprocess_propagation: bool,
 ):
     cfg = _VARIANTS[variant_name]
     prop = cfg["property_variant"]
@@ -96,6 +97,7 @@ def _run_variant(
             property_variant=prop,
             constrain_controlled_vars=lock,
             nusmv_opts=nusmv_opts,
+            preprocess_propagation=preprocess_propagation,
         )
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
@@ -157,6 +159,7 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
         "false_count",
         "mismatch_vs_baseline",
         "nusmv_opts",
+        "preprocess_propagation",
     ]
     with open(path, "w", encoding="utf-8") as fp:
         fp.write(",".join(header) + "\n")
@@ -181,6 +184,7 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
                         str(r["false_count"]),
                         str(r["mismatch_vs_baseline"]),
                         str(r["nusmv_opts"]),
+                        str(r["preprocess_propagation"]),
                     ]
                 )
                 + "\n"
@@ -211,6 +215,11 @@ def main():
         type=int,
         default=10,
         help="Print progress every N controls per variant (default: 10)",
+    )
+    ap.add_argument(
+        "--preprocess-propagation",
+        action="store_true",
+        help="Enable MPBN constant-propagation preprocessing per control",
     )
     ap.add_argument(
         "--nusmv-opts",
@@ -254,6 +263,7 @@ def main():
     nusmv_opts = {opt: True for opt in args.nusmv_opts}
     if nusmv_opts:
         print(f"nusmv_opts={sorted(nusmv_opts.keys())}")
+    print(f"preprocess_propagation={args.preprocess_propagation}")
 
     bn = load_bn_in_repo(args.instance)
 
@@ -266,6 +276,7 @@ def main():
             update_mode=args.update_mode,
             nusmv_opts=nusmv_opts,
             progress_every=args.progress_every,
+            preprocess_propagation=args.preprocess_propagation,
         )
 
     baseline_name = args.variants[0]
@@ -308,6 +319,7 @@ def main():
                 "false_count": rr["false_count"],
                 "mismatch_vs_baseline": mismatch,
                 "nusmv_opts": ";".join(sorted(nusmv_opts.keys())),
+                "preprocess_propagation": args.preprocess_propagation,
             }
         )
 

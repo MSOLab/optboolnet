@@ -125,17 +125,64 @@ def _nusmv_state(dstate):
     return " & ".join((_expr(n, v) for n, v in dstate.items()))
 
 
-def _nusmv_control_constraints(control):
+def _nusmv_control_constraints(control, allowed_vars=None):
     """Return INIT/INVAR constraints to lock controlled nodes, if any."""
     if not control:
         return ""
 
+    allowed = set(allowed_vars) if allowed_vars is not None else None
     terms = [
         f"{'' if value else '!'}{_nusmv_var(name)}"
         for name, value in sorted(control.items(), key=lambda kv: str(kv[0]))
+        if (allowed is None or name in allowed)
     ]
+    if not terms:
+        return ""
     expr = " & ".join(terms)
     return f"INIT {expr};\nINVAR {expr};\n"
+
+
+def _bool_from_expr_value(value):
+    s = str(value).strip().upper()
+    if s in ["TRUE", "1"]:
+        return True
+    if s in ["FALSE", "0"]:
+        return False
+    if isinstance(value, (int, bool)):
+        return bool(value)
+    raise ValueError(f"Cannot convert propagated constant '{value}' to boolean")
+
+
+def _preprocess_bn_with_mpbn(bn, control):
+    """Apply control-driven constant propagation and return a reduced BN.
+
+    The returned control is empty because the control values are already applied
+    directly to the reduced transition functions.
+    """
+    import mpbn
+
+    reduced = mpbn.MPBooleanNetwork(bn)
+    reduced.simplify(in_place=True)
+
+    if control is None:
+        control = {}
+    for k, v in control.items():
+        if k in reduced:
+            reduced[k] = 1 if v else 0
+
+    reduced.propagate_constants()
+    constants = {k: _bool_from_expr_value(v) for k, v in reduced.constants().items()}
+
+    # Remove constants except phenotype (keep it explicit for CTL/LTL specification).
+    for k in list(constants.keys()):
+        if k != bn.phenotype:
+            reduced.pop(k, None)
+
+    if bn.phenotype in constants and bn.phenotype not in reduced:
+        reduced[bn.phenotype] = 1 if constants[bn.phenotype] else 0
+
+    reduced_bn = bn.__class__(reduced, bn._control_config, to_cnf=True)
+    return reduced_bn, {}
 
 
 def _phenotype_spec_clause(phenotype_expr, property_variant):
@@ -335,6 +382,7 @@ def nusmv_check_phenotype(
     property_variant="ctl_ef_ag",
     constrain_controlled_vars=False,
     nusmv_opts=None,
+    preprocess_propagation=False,
 ):
     """
     Returns true if all the attractors have p=1 constantly
@@ -352,11 +400,21 @@ def nusmv_check_phenotype(
     nusmv_opts:
         Optional dict of boolean NuSMV command-line flags, e.g.
         {"dynamic": True, "reorder": True}.
+    preprocess_propagation:
+        If True, preprocess the BN with MPBN constant propagation under the given
+        control assignment, then run model checking on the reduced network.
     """
-    phenotype_expr = _sanitize_smv_expr(bn.phenotype)
-    nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
+    eval_bn = bn
+    eval_control = control if control is not None else {}
+    if preprocess_propagation:
+        eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
+
+    phenotype_expr = _sanitize_smv_expr(eval_bn.phenotype)
+    nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
     if constrain_controlled_vars:
-        nusmv_input += _nusmv_control_constraints(control)
+        nusmv_input += _nusmv_control_constraints(
+            eval_control, allowed_vars=eval_bn.vars_list
+        )
     nusmv_input += _phenotype_spec_clause(phenotype_expr, property_variant)
     return _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
 
@@ -367,6 +425,7 @@ def nusmv_check_phenotype_full(
     update_mode="synchronous",
     smvfile=None,
     nusmv_opts=None,
+    preprocess_propagation=False,
 ):
     """
     Like nusmv_check_phenotype but also returns the cycle length of the
@@ -387,8 +446,13 @@ def nusmv_check_phenotype_full(
     update_mode: synchronous (recommended), asynchronous, general
     smvfile: if None, uses a temporary file
     """
-    nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
-    nusmv_input += f"LTLSPEC F G {_sanitize_smv_expr(bn.phenotype)};"
+    eval_bn = bn
+    eval_control = control if control is not None else {}
+    if preprocess_propagation:
+        eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
+
+    nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
+    nusmv_input += f"LTLSPEC F G {_sanitize_smv_expr(eval_bn.phenotype)};"
     output = _nusmv_run(
         nusmv_input,
         smvfile,
