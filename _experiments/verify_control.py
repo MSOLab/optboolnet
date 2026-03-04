@@ -39,7 +39,12 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str]):
         n = len(ctrl_list)
         last_pct = 0
         for i, ctrl in enumerate(ctrl_list):
-            if not nusmv_check_phenotype(bn, control=ctrl):
+            if not nusmv_check_phenotype(
+                bn,
+                control=ctrl,
+                property_variant="ctl_ef_ag",
+                constrain_controlled_vars=True,
+            ):
                 print("incorrect", ctrl)
                 with open(output_file, "a", encoding="utf-8") as _f:
                     _f.write(f"{work_dir},{inst},{ctrl}\n")

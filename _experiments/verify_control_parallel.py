@@ -29,7 +29,12 @@ def _check_ctrl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, float]:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
     t0 = time.perf_counter()
-    ok = nusmv_check_phenotype(bn, control=ctrl)
+    ok = nusmv_check_phenotype(
+        bn,
+        control=ctrl,
+        property_variant="ctl_ef_ag",
+        constrain_controlled_vars=True,
+    )
     elapsed = time.perf_counter() - t0
     return ok, elapsed
 

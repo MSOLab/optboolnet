@@ -125,7 +125,32 @@ def _nusmv_state(dstate):
     return " & ".join((_expr(n, v) for n, v in dstate.items()))
 
 
-def _nusmv_run(nusmv_input, smvfile, with_counterexample=False):
+def _nusmv_control_constraints(control):
+    """Return INIT/INVAR constraints to lock controlled nodes, if any."""
+    if not control:
+        return ""
+
+    terms = [
+        f"{'' if value else '!'}{_nusmv_var(name)}"
+        for name, value in sorted(control.items(), key=lambda kv: str(kv[0]))
+    ]
+    expr = " & ".join(terms)
+    return f"INIT {expr};\nINVAR {expr};\n"
+
+
+def _phenotype_spec_clause(phenotype_expr, property_variant):
+    if property_variant == "ctl_ef_ag":
+        return f"CTLSPEC EF AG {phenotype_expr};"
+    if property_variant == "ltl_fg":
+        return f"LTLSPEC F G {phenotype_expr};"
+    raise ValueError(
+        "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ltl_fg".format(
+            property_variant
+        )
+    )
+
+
+def _nusmv_run(nusmv_input, smvfile, with_counterexample=False, nusmv_opts=None):
     """Write nusmv_input, invoke NuSMV, and return stdout as a string.
 
     with_counterexample: if True, omit -dcx so NuSMV includes the trace.
@@ -138,6 +163,16 @@ def _nusmv_run(nusmv_input, smvfile, with_counterexample=False):
         with open(smvfile, "w") as fp:
             fp.write(nusmv_input)
         mc = NuSMV(smvfile)
+        if nusmv_opts:
+            for opt_name, enabled in nusmv_opts.items():
+                if not isinstance(enabled, bool):
+                    raise ValueError(
+                        f"NuSMV option '{opt_name}' must be bool, got {type(enabled).__name__}"
+                    )
+                if enabled:
+                    mc.opts[opt_name] = True
+                else:
+                    mc.opts.pop(opt_name, None)
         if with_counterexample:
             mc.opts.pop("dcx", None)
         return mc.check_output()
@@ -150,8 +185,8 @@ def _nusmv_run(nusmv_input, smvfile, with_counterexample=False):
                 pass
 
 
-def _nusmv_alltrue(nusmv_input, smvfile):
-    output = _nusmv_run(nusmv_input, smvfile)
+def _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=None):
+    output = _nusmv_run(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
     return all(
         line.split()[-1] == "true"
         for line in output.split("\n")
@@ -180,7 +215,12 @@ def _parse_loop_length(output):
 
 
 def nusmv_check_attractor(
-    bn, attractor, control=None, update_mode="synchronous", smvfile=None
+    bn,
+    attractor,
+    control=None,
+    update_mode="synchronous",
+    smvfile=None,
+    nusmv_opts=None,
 ):
     """
     Returns true if attractor is indeed an attractor of the bn
@@ -196,10 +236,18 @@ def nusmv_check_attractor(
     nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
     nusmv_input += f"INIT {dstate_smv};\n"
     nusmv_input += f"CTLSPEC AG EF ({dstate_smv});"
-    return _nusmv_alltrue(nusmv_input, smvfile)
+    return _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
 
 
-def nusmv_check_phenotype(bn, control=None, update_mode="synchronous", smvfile=None):
+def nusmv_check_phenotype(
+    bn,
+    control=None,
+    update_mode="synchronous",
+    smvfile=None,
+    property_variant="ctl_ef_ag",
+    constrain_controlled_vars=False,
+    nusmv_opts=None,
+):
     """
     Returns true if all the attractors have p=1 constantly
 
@@ -207,13 +255,31 @@ def nusmv_check_phenotype(bn, control=None, update_mode="synchronous", smvfile=N
     control: Control
     update_mode: synchronous, asynchronous, general
     smvfile: if None, uses a temporary file
+    property_variant:
+        - "ctl_ef_ag" (default): CTLSPEC EF AG phenotype
+        - "ltl_fg": LTLSPEC F G phenotype
+    constrain_controlled_vars:
+        If True, adds INIT/INVAR constraints for controlled nodes to reduce the
+        state space explored by NuSMV.
+    nusmv_opts:
+        Optional dict of boolean NuSMV command-line flags, e.g.
+        {"dynamic": True, "reorder": True}.
     """
+    phenotype_expr = _sanitize_smv_expr(bn.phenotype)
     nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
-    nusmv_input += f"CTLSPEC EF AG {_sanitize_smv_expr(bn.phenotype)};"
-    return _nusmv_alltrue(nusmv_input, smvfile)
+    if constrain_controlled_vars:
+        nusmv_input += _nusmv_control_constraints(control)
+    nusmv_input += _phenotype_spec_clause(phenotype_expr, property_variant)
+    return _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
 
 
-def nusmv_check_phenotype_full(bn, control=None, update_mode="synchronous", smvfile=None):
+def nusmv_check_phenotype_full(
+    bn,
+    control=None,
+    update_mode="synchronous",
+    smvfile=None,
+    nusmv_opts=None,
+):
     """
     Like nusmv_check_phenotype but also returns the cycle length of the
     counterexample attractor when the check fails.
@@ -235,7 +301,12 @@ def nusmv_check_phenotype_full(bn, control=None, update_mode="synchronous", smvf
     """
     nusmv_input = _nusmv_model(bn, control=control, update_mode=update_mode)
     nusmv_input += f"LTLSPEC F G {_sanitize_smv_expr(bn.phenotype)};"
-    output = _nusmv_run(nusmv_input, smvfile, with_counterexample=True)
+    output = _nusmv_run(
+        nusmv_input,
+        smvfile,
+        with_counterexample=True,
+        nusmv_opts=nusmv_opts,
+    )
     ok = all(
         line.split()[-1] == "true"
         for line in output.split("\n")
