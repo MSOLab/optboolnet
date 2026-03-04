@@ -51,6 +51,17 @@ def _sanitize_smv_expr(expr):
     )
 
 
+def _smv_expr_from_raw(expr):
+    """Convert a raw Boolean expression into a NuSMV-compatible expression string."""
+    s = str(expr).strip()
+    su = s.upper()
+    if su in {"1", "TRUE"}:
+        return "TRUE"
+    if su in {"0", "FALSE"}:
+        return "FALSE"
+    return _sanitize_smv_expr(s)
+
+
 def _nusmv_model(bn, control=None, update_mode="synchronous"):
     """
     bn: minibn.CNFBooleanNetwork
@@ -58,7 +69,7 @@ def _nusmv_model(bn, control=None, update_mode="synchronous"):
     update_mode: synchronous, asynchronous
     """
 
-    dom = bn.vars_list
+    dom = list(bn.keys())
     udom = ["u%s" % n for n in dom]
     var = _nusmv_var
 
@@ -76,27 +87,11 @@ def _nusmv_model(bn, control=None, update_mode="synchronous"):
     lines.append("DEFINE")
     if control is None:
         control = {}
-    for n in bn.vars_list:
+    for n in dom:
         if n in control:
             lines.append(f"f{n} := {'TRUE' if control[n] else 'FALSE'};")
             continue
-        clauses = bn.items_clause(n)
-        if not clauses:
-            lines.append(f"f{n} := FALSE;")
-        elif len(clauses) == 1 and not clauses[0].args:
-            lines.append(f"f{n} := TRUE;")
-        else:
-
-            def smv_or(clause):
-                neg = [f"!{var(m)}" for m in clause.neg_literals]
-                pos = [f"{var(m)}" for m in clause.pos_literals]
-                expr = " | ".join(neg + pos)
-                if len(neg + pos) > 1:
-                    expr = f"({expr})"
-                return expr
-
-            smv_and = " & ".join((smv_or(clause) for clause in clauses))
-            lines.append(f"f{n} := {smv_and};")
+        lines.append(f"f{n} := {_smv_expr_from_raw(bn[n])};")
 
     if update_mode != "synchronous":
         lines.append(
@@ -181,8 +176,8 @@ def _preprocess_bn_with_mpbn(bn, control):
     if bn.phenotype in constants and bn.phenotype not in reduced:
         reduced[bn.phenotype] = 1 if constants[bn.phenotype] else 0
 
-    reduced_bn = bn.__class__(reduced, bn._control_config, to_cnf=True)
-    return reduced_bn, {}
+    # reduced_bn = bn.__class__(reduced, bn._control_config)
+    return reduced, {}
 
 
 def _phenotype_spec_clause(phenotype_expr, property_variant):
@@ -239,7 +234,7 @@ def _nusmv_model_param_controls(
             "Parameterized-control batch checking currently supports synchronous update mode only"
         )
 
-    dom = bn.vars_list
+    dom = list(bn.keys())
     var = _nusmv_var
     ctrl_var_map = _control_param_vars(dom)
 
@@ -261,23 +256,7 @@ def _nusmv_model_param_controls(
 
     lines.append("DEFINE")
     for n in dom:
-        clauses = bn.items_clause(n)
-        if not clauses:
-            lines.append(f"f{n} := FALSE;")
-        elif len(clauses) == 1 and not clauses[0].args:
-            lines.append(f"f{n} := TRUE;")
-        else:
-
-            def smv_or(clause):
-                neg = [f"!{var(m)}" for m in clause.neg_literals]
-                pos = [f"{var(m)}" for m in clause.pos_literals]
-                expr = " | ".join(neg + pos)
-                if len(neg + pos) > 1:
-                    expr = f"({expr})"
-                return expr
-
-            smv_and = " & ".join((smv_or(clause) for clause in clauses))
-            lines.append(f"f{n} := {smv_and};")
+        lines.append(f"f{n} := {_smv_expr_from_raw(bn[n])};")
 
     if constrain_controlled_vars:
         lock_terms = []
@@ -382,7 +361,7 @@ def nusmv_check_phenotype(
     property_variant="ctl_ef_ag",
     constrain_controlled_vars=False,
     nusmv_opts=None,
-    preprocess_propagation=False,
+    preprocess_propagation=True,
 ):
     """
     Returns true if all the attractors have p=1 constantly
@@ -409,11 +388,11 @@ def nusmv_check_phenotype(
     if preprocess_propagation:
         eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
 
-    phenotype_expr = _sanitize_smv_expr(eval_bn.phenotype)
+    phenotype_expr = _sanitize_smv_expr(bn.phenotype)
     nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
     if constrain_controlled_vars:
         nusmv_input += _nusmv_control_constraints(
-            eval_control, allowed_vars=eval_bn.vars_list
+            eval_control, allowed_vars=list(eval_bn.keys())
         )
     nusmv_input += _phenotype_spec_clause(phenotype_expr, property_variant)
     return _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
@@ -425,7 +404,7 @@ def nusmv_check_phenotype_full(
     update_mode="synchronous",
     smvfile=None,
     nusmv_opts=None,
-    preprocess_propagation=False,
+    preprocess_propagation=True,
 ):
     """
     Like nusmv_check_phenotype but also returns the cycle length of the
@@ -492,7 +471,7 @@ def nusmv_check_phenotype_batch(
         constrain_controlled_vars=constrain_controlled_vars,
     )
     for ctrl in controls:
-        ctrl_expr = _nusmv_control_assignment(ctrl, bn.vars_list, ctrl_var_map)
+        ctrl_expr = _nusmv_control_assignment(ctrl, list(bn.keys()), ctrl_var_map)
         nusmv_input += f"{spec_kw} ({ctrl_expr}) -> ({temporal_expr});\n"
 
     output = _nusmv_run(nusmv_input, smvfile, nusmv_opts=nusmv_opts)

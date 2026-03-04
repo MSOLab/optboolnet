@@ -34,6 +34,7 @@ def _check_ctrl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, float]:
         control=ctrl,
         property_variant="ctl_ef_ag",
         constrain_controlled_vars=True,
+        preprocess_propagation=True,
     )
     elapsed = time.perf_counter() - t0
     return ok, elapsed
@@ -45,7 +46,11 @@ def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int]
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
     t0 = time.perf_counter()
-    _, loop_len = nusmv_check_phenotype_full(bn, control=ctrl)
+    _, loop_len = nusmv_check_phenotype_full(
+        bn,
+        control=ctrl,
+        preprocess_propagation=True,
+    )
     elapsed = time.perf_counter() - t0
     return loop_len, elapsed
 

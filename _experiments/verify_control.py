@@ -44,6 +44,7 @@ def verify_work_dir(work_dir: str, output_file: str, instances: List[str]):
                 control=ctrl,
                 property_variant="ctl_ef_ag",
                 constrain_controlled_vars=True,
+                preprocess_propagation=True,
             ):
                 print("incorrect", ctrl)
                 with open(output_file, "a", encoding="utf-8") as _f:

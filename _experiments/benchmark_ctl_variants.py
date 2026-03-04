@@ -218,8 +218,9 @@ def main():
     )
     ap.add_argument(
         "--preprocess-propagation",
-        action="store_true",
-        help="Enable MPBN constant-propagation preprocessing per control",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable MPBN constant-propagation preprocessing per control (default: enabled)",
     )
     ap.add_argument(
         "--nusmv-opts",
