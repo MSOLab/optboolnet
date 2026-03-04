@@ -139,15 +139,107 @@ def _nusmv_control_constraints(control):
 
 
 def _phenotype_spec_clause(phenotype_expr, property_variant):
+    temporal_expr = _phenotype_temporal_expr(phenotype_expr, property_variant)
+    spec_kw = "CTLSPEC" if property_variant == "ctl_ef_ag" else "LTLSPEC"
+    return f"{spec_kw} {temporal_expr};"
+
+
+def _phenotype_temporal_expr(phenotype_expr, property_variant):
     if property_variant == "ctl_ef_ag":
-        return f"CTLSPEC EF AG {phenotype_expr};"
+        return f"EF AG {phenotype_expr}"
     if property_variant == "ltl_fg":
-        return f"LTLSPEC F G {phenotype_expr};"
+        return f"F G {phenotype_expr}"
     raise ValueError(
         "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ltl_fg".format(
             property_variant
         )
     )
+
+
+def _nusmv_spec_truths(output):
+    return [
+        line.split()[-1] == "true"
+        for line in output.split("\n")
+        if line.startswith("-- specification ")
+    ]
+
+
+def _control_param_vars(dom):
+    return {n: (f"__lk{idx}", f"__cv{idx}") for idx, n in enumerate(dom)}
+
+
+def _nusmv_control_assignment(control, dom, ctrl_var_map):
+    terms = []
+    for n in dom:
+        lock_var, val_var = ctrl_var_map[n]
+        if n in control:
+            terms.append(lock_var)
+            terms.append(val_var if control[n] else f"!{val_var}")
+        else:
+            terms.append(f"!{lock_var}")
+    return " & ".join(terms)
+
+
+def _nusmv_model_param_controls(
+    bn, update_mode="synchronous", constrain_controlled_vars=True
+):
+    """NuSMV model with parameterized controls via FROZENVAR lock/value pairs.
+
+    This builder currently supports synchronous updates.
+    """
+    if update_mode != "synchronous":
+        raise NotImplementedError(
+            "Parameterized-control batch checking currently supports synchronous update mode only"
+        )
+
+    dom = bn.vars_list
+    var = _nusmv_var
+    ctrl_var_map = _control_param_vars(dom)
+
+    lines = ["MODULE main"]
+    lines.append("VAR")
+    for i in dom:
+        lines.append(f"{var(i)}: boolean;")
+
+    lines.append("FROZENVAR")
+    for n in dom:
+        lock_var, val_var = ctrl_var_map[n]
+        lines.append(f"{lock_var}: boolean;")
+        lines.append(f"{val_var}: boolean;")
+
+    lines.append("ASSIGN")
+    for i in dom:
+        lock_var, val_var = ctrl_var_map[i]
+        lines.append(f"next({var(i)}) := case {lock_var}: {val_var}; TRUE: f{i}; esac;")
+
+    lines.append("DEFINE")
+    for n in dom:
+        clauses = bn.items_clause(n)
+        if not clauses:
+            lines.append(f"f{n} := FALSE;")
+        elif len(clauses) == 1 and not clauses[0].args:
+            lines.append(f"f{n} := TRUE;")
+        else:
+
+            def smv_or(clause):
+                neg = [f"!{var(m)}" for m in clause.neg_literals]
+                pos = [f"{var(m)}" for m in clause.pos_literals]
+                expr = " | ".join(neg + pos)
+                if len(neg + pos) > 1:
+                    expr = f"({expr})"
+                return expr
+
+            smv_and = " & ".join((smv_or(clause) for clause in clauses))
+            lines.append(f"f{n} := {smv_and};")
+
+    if constrain_controlled_vars:
+        lock_terms = []
+        for n in dom:
+            lock_var, val_var = ctrl_var_map[n]
+            lock_terms.append(f"(!{lock_var} | ({var(n)} = {val_var}))")
+        lines.append(f"INVAR {' & '.join(lock_terms)};")
+
+    return "\n".join(lines) + "\n", ctrl_var_map
 
 
 def _nusmv_run(nusmv_input, smvfile, with_counterexample=False, nusmv_opts=None):
@@ -187,11 +279,7 @@ def _nusmv_run(nusmv_input, smvfile, with_counterexample=False, nusmv_opts=None)
 
 def _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=None):
     output = _nusmv_run(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
-    return all(
-        line.split()[-1] == "true"
-        for line in output.split("\n")
-        if line.startswith("-- specification ")
-    )
+    return all(_nusmv_spec_truths(output))
 
 
 def _parse_loop_length(output):
@@ -308,8 +396,45 @@ def nusmv_check_phenotype_full(
         nusmv_opts=nusmv_opts,
     )
     ok = all(
-        line.split()[-1] == "true"
-        for line in output.split("\n")
-        if line.startswith("-- specification ")
+        _nusmv_spec_truths(output)
     )
     return ok, (None if ok else _parse_loop_length(output))
+
+
+def nusmv_check_phenotype_batch(
+    bn,
+    controls,
+    update_mode="synchronous",
+    smvfile=None,
+    property_variant="ctl_ef_ag",
+    constrain_controlled_vars=True,
+    nusmv_opts=None,
+):
+    """Batch phenotype checks for multiple controls in one NuSMV invocation.
+
+    Returns a list of booleans in the same order as `controls`.
+    """
+    controls = list(controls)
+    if not controls:
+        return []
+
+    phenotype_expr = _sanitize_smv_expr(bn.phenotype)
+    temporal_expr = _phenotype_temporal_expr(phenotype_expr, property_variant)
+    spec_kw = "CTLSPEC" if property_variant == "ctl_ef_ag" else "LTLSPEC"
+
+    nusmv_input, ctrl_var_map = _nusmv_model_param_controls(
+        bn,
+        update_mode=update_mode,
+        constrain_controlled_vars=constrain_controlled_vars,
+    )
+    for ctrl in controls:
+        ctrl_expr = _nusmv_control_assignment(ctrl, bn.vars_list, ctrl_var_map)
+        nusmv_input += f"{spec_kw} ({ctrl_expr}) -> ({temporal_expr});\n"
+
+    output = _nusmv_run(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
+    results = _nusmv_spec_truths(output)
+    if len(results) != len(controls):
+        raise RuntimeError(
+            f"Unexpected number of spec results: got {len(results)}, expected {len(controls)}"
+        )
+    return results
