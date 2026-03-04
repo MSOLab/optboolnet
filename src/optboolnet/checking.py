@@ -430,8 +430,9 @@ def nusmv_check_phenotype_full(
     if preprocess_propagation:
         eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
 
+    phenotype_expr = _sanitize_smv_expr(bn.phenotype)
     nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
-    nusmv_input += f"LTLSPEC F G {_sanitize_smv_expr(eval_bn.phenotype)};"
+    nusmv_input += f"LTLSPEC F G {phenotype_expr};"
     output = _nusmv_run(
         nusmv_input,
         smvfile,

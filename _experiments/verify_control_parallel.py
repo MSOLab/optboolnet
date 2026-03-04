@@ -55,6 +55,21 @@ def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int]
     return loop_len, elapsed
 
 
+def _check_ctrl_ltl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, Optional[int], float]:
+    """LTL phenotype check with counterexample loop length."""
+    if inst_name not in _worker_bns:
+        _worker_bns[inst_name] = load_bn_in_repo(inst_name)
+    bn = _worker_bns[inst_name]
+    t0 = time.perf_counter()
+    ok, loop_len = nusmv_check_phenotype_full(
+        bn,
+        control=ctrl,
+        preprocess_propagation=True,
+    )
+    elapsed = time.perf_counter() - t0
+    return ok, loop_len, elapsed
+
+
 # ---------------------------------------------------------------------------
 # Main-process result cache (persists for the full run across all work_dirs)
 # Key: (inst_name, ctrl_key)  Value: ok (bool only — elapsed is not stored)
@@ -187,13 +202,24 @@ def _log_result(
     ctrl: Control,
     ok: bool,
     elapsed: float,
+    loop_len: Optional[int] = None,
+    logic: str = "ctl",
 ):
     if ok:
-        line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
+        if logic == "ltl":
+            line = f"{work_dir},{inst},{ctrl},OK,LOOP_LEN,{loop_len},{elapsed:.1f}s"
+        else:
+            line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
     else:
         tag = os.path.basename(work_dir)
-        print(f"\tincorrect [{tag}/{inst}] {ctrl} ({elapsed:.1f}s)")
-        line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
+        if logic == "ltl":
+            print(f"\tincorrect [{tag}/{inst}] {ctrl} loop={loop_len} ({elapsed:.1f}s)")
+            line = (
+                f"{work_dir},{inst},{ctrl},INCORRECT,LOOP_LEN,{loop_len},{elapsed:.1f}s"
+            )
+        else:
+            print(f"\tincorrect [{tag}/{inst}] {ctrl} ({elapsed:.1f}s)")
+            line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
 
@@ -234,7 +260,12 @@ def _collect_pairs(
 
 
 def verify_all(
-    work_dir_list: List[str], output_file: str, instances: List[str], workers: int, json_path: str
+    work_dir_list: List[str],
+    output_file: str,
+    instances: List[str],
+    workers: int,
+    json_path: str,
+    logic: str = "ctl",
 ) -> List[Tuple[str, str, Control]]:
     """
     Verify controls from all work_dirs using a single shared worker pool.
@@ -263,29 +294,32 @@ def verify_all(
         return []
 
     # Phase 2: split cached vs to-run.
+    # In LTL mode, recompute all controls because boolean cache does not store
+    # loop lengths and we want LOOP_LEN logged in the output.
     to_run: List[Tuple[str, str, Control, tuple]] = []
     for work_dir, inst, ctrl in all_triplets:
         key = (inst, _ctrl_key(ctrl))
-        if key not in _result_cache:
+        if logic == "ltl" or key not in _result_cache:
             to_run.append((work_dir, inst, ctrl, key))
 
     n_cached = total - len(to_run)
     n_wds = len({wd for wd, _, _ in all_triplets})
     print(
         f"Total: {total} checks ({n_cached} cached, {len(to_run)} to compute)"
-        f" across {n_wds} experiment(s), {workers} workers"
+        f" across {n_wds} experiment(s), {workers} workers [{logic.upper()}]"
     )
 
     incorrect: List[Tuple[str, str, Control]] = []
 
     # Flush cached results (elapsed = 0.0s).
-    for work_dir, inst, ctrl in all_triplets:
-        key = (inst, _ctrl_key(ctrl))
-        if key in _result_cache:
-            ok = _result_cache[key]
-            _log_result(output_file, work_dir, inst, ctrl, ok, 0.0)
-            if not ok:
-                incorrect.append((work_dir, inst, ctrl))
+    if logic == "ctl":
+        for work_dir, inst, ctrl in all_triplets:
+            key = (inst, _ctrl_key(ctrl))
+            if key in _result_cache:
+                ok = _result_cache[key]
+                _log_result(output_file, work_dir, inst, ctrl, ok, 0.0, logic=logic)
+                if not ok:
+                    incorrect.append((work_dir, inst, ctrl))
 
     # Mark (work_dir, inst) pairs that are fully covered by cache as done now.
     wdi_to_run_count: Dict[Tuple[str, str], int] = {}
@@ -304,17 +338,41 @@ def verify_all(
     last_pct_by_wdi: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_check_ctrl_for_inst, inst, ctrl): (work_dir, inst, ctrl, key)
-            for work_dir, inst, ctrl, key in to_run
-        }
+        if logic == "ltl":
+            futures = {
+                executor.submit(_check_ctrl_ltl_for_inst, inst, ctrl): (
+                    work_dir,
+                    inst,
+                    ctrl,
+                    key,
+                )
+                for work_dir, inst, ctrl, key in to_run
+            }
+        else:
+            futures = {
+                executor.submit(_check_ctrl_for_inst, inst, ctrl): (work_dir, inst, ctrl, key)
+                for work_dir, inst, ctrl, key in to_run
+            }
         for future in as_completed(futures):
             work_dir, inst, ctrl, key = futures[future]
-            ok, elapsed = future.result()
+            if logic == "ltl":
+                ok, loop_len, elapsed = future.result()
+            else:
+                ok, elapsed = future.result()
+                loop_len = None
 
             _result_cache[key] = ok
             update_checker_json(json_path, inst, ctrl, ok)
-            _log_result(output_file, work_dir, inst, ctrl, ok, elapsed)
+            _log_result(
+                output_file,
+                work_dir,
+                inst,
+                ctrl,
+                ok,
+                elapsed,
+                loop_len=loop_len,
+                logic=logic,
+            )
             if not ok:
                 incorrect.append((work_dir, inst, ctrl))
 
@@ -426,6 +484,12 @@ if __name__ == "__main__":
         default="_experiments/checker.json",
         help="Persistent JSON cache for check results (default: _experiments/checker.json)",
     )
+    ap.add_argument(
+        "--logic",
+        choices=["ctl", "ltl"],
+        default="ctl",
+        help="Model-checking logic to run (default: ctl). In ltl mode, LOOP_LEN is logged.",
+    )
     args = ap.parse_args()
 
     n = load_checker_json(args.json)
@@ -438,7 +502,7 @@ if __name__ == "__main__":
     with open(args.output, "a", encoding="utf-8") as _f:
         _f.write(
             f"# [{_timestamp}] work_dirs=[{_dirs_str}] instances=[{_insts_str}]"
-            f" workers={args.workers}\n"
+            f" workers={args.workers} logic={args.logic}\n"
         )
 
     if args.work_dirs:
@@ -457,7 +521,14 @@ if __name__ == "__main__":
         for d in work_dir_list:
             print(f"  {d}")
 
-    all_incorrect = verify_all(work_dir_list, args.output, args.instances, args.workers, args.json)
+    all_incorrect = verify_all(
+        work_dir_list,
+        args.output,
+        args.instances,
+        args.workers,
+        args.json,
+        logic=args.logic,
+    )
 
     # Call get_loop_lengths(all_incorrect, args.output, args.workers) here
     # to run LTL counterexample analysis on the incorrect controls.
