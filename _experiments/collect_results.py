@@ -109,6 +109,7 @@ def collect_metric(
             exp = Experiment(exp_dir, alg, ["experiment"], [exp_name])
             df = exp.get_agg_table(metric)
             df["max_length"] = config.get("max_length", None)
+            df["max_control_size"] = config.get("max_control_size", None)
             frames.append(df)
         except Exception as exc:
             print(
@@ -187,10 +188,14 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
 
     # -- Per-inst metrics (broadcast across levels) --------------------------
 
-    # build_time: (experiment, inst, build_time, max_length)
+    # build_time: (experiment, inst, build_time, max_length, max_control_size)
     if "build_time" in metric_dfs:
         df = _str_inst(metric_dfs["build_time"])
-        cols = [c for c in [*_INST_KEY, "max_length", "build_time"] if c in df.columns]
+        cols = [
+            c
+            for c in [*_INST_KEY, "max_length", "max_control_size", "build_time"]
+            if c in df.columns
+        ]
         result = _merge(result, df[cols], _INST_KEY)
 
     # max_level: (experiment, inst, max_level)
@@ -227,13 +232,19 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
     if result is None:
         return None
 
-    # Backfill max_length from any metric that carries it (in case build_time
-    # was not collected).
+    # Backfill max_length / max_control_size from any metric that carries them
+    # (in case build_time was not collected).
     if "max_length" not in result.columns:
         for df in metric_dfs.values():
             if "max_length" in df.columns:
                 ml = _str_inst(df)[_INST_KEY + ["max_length"]].drop_duplicates()
                 result = result.merge(ml, on=_INST_KEY, how="left")
+                break
+    if "max_control_size" not in result.columns:
+        for df in metric_dfs.values():
+            if "max_control_size" in df.columns:
+                mcs = _str_inst(df)[_INST_KEY + ["max_control_size"]].drop_duplicates()
+                result = result.merge(mcs, on=_INST_KEY, how="left")
                 break
 
     return result
@@ -264,10 +275,14 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
             return right.copy()
         return left.merge(right, on=_INST_KEY, how="outer")
 
-    # build_time: (experiment, inst, build_time, max_length)
+    # build_time: (experiment, inst, build_time, max_length, max_control_size)
     if "build_time" in metric_dfs:
         df = _str_inst(metric_dfs["build_time"])
-        cols = [c for c in [*_INST_KEY, "max_length", "build_time"] if c in df.columns]
+        cols = [
+            c
+            for c in [*_INST_KEY, "max_length", "max_control_size", "build_time"]
+            if c in df.columns
+        ]
         result = _merge(result, df[cols])
 
     # max_level: (experiment, inst, max_level)
@@ -346,6 +361,12 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
                 ml = _str_inst(df)[_INST_KEY + ["max_length"]].drop_duplicates()
                 result = result.merge(ml, on=_INST_KEY, how="left")
                 break
+    if "max_control_size" not in result.columns:
+        for df in metric_dfs.values():
+            if "max_control_size" in df.columns:
+                mcs = _str_inst(df)[_INST_KEY + ["max_control_size"]].drop_duplicates()
+                result = result.merge(mcs, on=_INST_KEY, how="left")
+                break
 
     return result
 
@@ -409,7 +430,11 @@ def main() -> None:
     for exp_name, exp_dir, alg in experiments:
         cfg = read_alg_config(exp_dir)
         max_length = cfg.get("max_length", "?")
-        print(f"  {exp_name:<25}  alg: {alg:<10}  max_length: {max_length}")
+        max_control_size = cfg.get("max_control_size", "?")
+        print(
+            f"  {exp_name:<25}  alg: {alg:<10}  "
+            f"max_length: {max_length:<4}  max_control_size: {max_control_size}"
+        )
 
     if args.list:
         return

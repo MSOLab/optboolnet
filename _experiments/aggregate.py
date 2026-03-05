@@ -9,6 +9,10 @@ Files produced:
   agg_cuts_total.csv       (section, alg, cut) × (T_max, inst)  →  # cuts
   agg_cuts_avg.csv         (section, alg, cut) × (T_max, inst)  →  avg literals
 
+Cut tables are inferred dynamically from columns in summary_per_inst.csv:
+  count_cuts_*
+  avg_cuts_*
+
 Usage:
   python aggregate.py _experiments/260302_fixed/_results
   python aggregate.py _experiments/260302_fixed/_results --variant decomp
@@ -31,15 +35,13 @@ LABEL_MAP: dict[str, str] = {
     # 'MibS_45':       'PBN',
 }
 
-# (section_label, alg_prefix, csv_column, display_label)
-_CUT_SPECS = [
-    ("Total # of cuts", "SEP", "count_cuts_TRAP_SPACE_CUT", "TS cut"),
-    ("Total # of cuts", "SEP", "count_cuts_ATTRACTOR_CUT", "AT cut"),
-    ("Total # of cuts", "BEN", "count_cuts_ATTRACTOR_CUT", "AT cut"),
-    ("Avg. literals in a cut", "SEP", "avg_cuts_TRAP_SPACE_CUT", "TS cut"),
-    ("Avg. literals in a cut", "SEP", "avg_cuts_ATTRACTOR_CUT", "AT cut"),
-    ("Avg. literals in a cut", "BEN", "avg_cuts_ATTRACTOR_CUT", "AT cut"),
-]
+_CUT_LABEL_MAP: dict[str, str] = {
+    "ATTRACTOR_CUT": "AT cut",
+    "TRAP_SPACE_CUT": "TS cut",
+    "MINIMALITY": "MIN cut",
+    "NO_GOOD_MASTER": "No-good(master)",
+    "NO_GOOD_LOWER_LEVEL": "No-good(lower)",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -74,20 +76,43 @@ def make_solution_count_bold(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame
     if "level_finished" not in ct.columns:
         return base
 
-    # For each (experiment, inst): was the highest-numbered level finished?
-    top = (
-        ct.sort_values("level")
-        .groupby(["experiment", "inst"])
-        .last()
-        .reset_index()
-        [["experiment", "inst", "level_finished"]]
-    )
-    finished_pairs = set(
-        zip(
-            top.loc[top["level_finished"], "experiment"],
-            top.loc[top["level_finished"], "inst"],
+    keys = ["experiment", "inst"]
+
+    # For each (experiment, inst): highest finished level.
+    finished = ct[ct["level_finished"] == True].copy()
+    if finished.empty:
+        finished_pairs = set()
+    else:
+        finished_max = (
+            finished.groupby(keys, as_index=False)["level"].max()
+            .rename(columns={"level": "finished_level"})
         )
-    )
+
+        # Determine required top level.
+        # Preferred: max_control_size from summary_per_inst.
+        # Fallback (older results): max level observed in completion_time for the experiment.
+        if "max_control_size" in df.columns:
+            req = (
+                df[keys + ["max_control_size"]]
+                .drop_duplicates()
+                .rename(columns={"max_control_size": "required_level"})
+            )
+            req["required_level"] = pd.to_numeric(req["required_level"], errors="coerce")
+        else:
+            req = (
+                ct.groupby("experiment", as_index=False)["level"].max()
+                .rename(columns={"level": "required_level"})
+            )
+            req = finished_max[["experiment", "inst"]].merge(req, on="experiment", how="left")
+
+        chk = finished_max.merge(req, on=keys, how="left")
+        chk = chk[chk["required_level"].notna()]
+        finished_pairs = set(
+            zip(
+                chk.loc[chk["finished_level"] >= chk["required_level"], "experiment"],
+                chk.loc[chk["finished_level"] >= chk["required_level"], "inst"],
+            )
+        )
 
     out = base.copy().astype(object)
     for (_, experiment), row in base.iterrows():
@@ -136,21 +161,33 @@ def make_completion_time(ct: pd.DataFrame, variant: str | None) -> pd.DataFrame:
     return tbl
 
 
-def _cuts_for_ml(spi_ml: pd.DataFrame, specs: list) -> pd.DataFrame | None:
+def _cut_columns(spi: pd.DataFrame, col_prefix: str) -> list[str]:
+    return sorted(c for c in spi.columns if c.startswith(f"{col_prefix}_"))
+
+
+def _cut_display_label(col_name: str, col_prefix: str) -> str:
+    raw = col_name[len(col_prefix) + 1 :]
+    return _CUT_LABEL_MAP.get(raw, raw)
+
+
+def _cuts_for_ml(spi_ml: pd.DataFrame, cut_cols: list[str], section: str, col_prefix: str) -> pd.DataFrame | None:
     """Build one (row-index, inst) slice for a single max_length value."""
     inst_present = [i for i in INST_ORDER if i in spi_ml["inst"].values]
     rows = []
-    for section, alg, col, cut_label in specs:
-        if col not in spi_ml.columns:
-            continue
-        sub = (
-            spi_ml[spi_ml["alg"] == alg]
-            .groupby("inst")[col]
-            .mean()  # averages agg/decomp variants if both present
-            .reindex(inst_present)
-        )
-        sub.name = (section, alg, cut_label)
-        rows.append(sub)
+    for alg in sorted(spi_ml["alg"].dropna().unique()):
+        spi_alg = spi_ml[spi_ml["alg"] == alg]
+        for col in cut_cols:
+            if col not in spi_alg.columns:
+                continue
+            sub = (
+                spi_alg.groupby("inst")[col]
+                .mean()  # averages variants if both present
+                .reindex(inst_present)
+            )
+            if sub.notna().sum() == 0:
+                continue
+            sub.name = (section, alg, _cut_display_label(col, col_prefix))
+            rows.append(sub)
     if not rows:
         return None
     tbl = pd.concat(rows, axis=1).T
@@ -168,12 +205,15 @@ def make_cuts_table(
         spi = spi[spi["experiment"].str.endswith(variant)]
     spi["alg"] = spi["experiment"].str.split("_").str[0]
 
-    specs = [(s, a, c, l) for s, a, c, l in _CUT_SPECS if col_prefix in c]
+    cut_cols = _cut_columns(spi, col_prefix)
+    if not cut_cols:
+        return pd.DataFrame()
+    section = "Total # of cuts" if col_prefix == "count_cuts" else "Avg. literals in a cut"
     ml_values = sorted(spi["max_length"].unique())
 
     parts: dict[int, pd.DataFrame] = {}
     for ml in ml_values:
-        tbl_ml = _cuts_for_ml(spi[spi["max_length"] == ml], specs)
+        tbl_ml = _cuts_for_ml(spi[spi["max_length"] == ml], cut_cols, section, col_prefix)
         if tbl_ml is not None:
             parts[ml] = tbl_ml
 

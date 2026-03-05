@@ -77,12 +77,10 @@ class BendersAnalysis:
         self.inst = inst
         self.build_log = self.rename_exp(pd.read_csv(build_log_fname))
         self.solve_log = self.rename_exp(pd.read_csv(solve_log_fname))
-        try:
-            self.solve_log["model"] = (
-                self.solve_log["model"].str.replace("'", "").astype(pd.Int64Dtype())
-            )
-        except:
-            pass
+        if "model" in self.solve_log.columns:
+            model_clean = self.solve_log["model"].astype(str).str.replace("'", "", regex=False)
+            self.solve_log["model"] = model_clean
+            self.solve_log["model_num"] = pd.to_numeric(model_clean, errors="coerce")
         self.cut_log = self.rename_exp(pd.read_csv(cut_log_fname))
 
     @property
@@ -192,16 +190,23 @@ class BendersAnalysis:
 
     @property
     def count_attractor_size(self):
-        
+        if "model_num" not in self.solve_log.columns:
+            return pd.DataFrame(
+                columns=self.key_list + ["model", "attractors"]
+            )
+
         count_df = (
             self.solve_log.loc[
-                self.solve_log["step"] == EnumBendersStep.LOWER_LEVEL_PROBLEM.name,
-                self.key_list + ["model", "timestamp"],
+                (self.solve_log["step"] == EnumBendersStep.LOWER_LEVEL_PROBLEM.name)
+                & (self.solve_log["model_num"].notna()),
+                self.key_list + ["model_num", "timestamp"],
             ]
-            .groupby(self.key_list + ["model"])
+            .groupby(self.key_list + ["model_num"])
             .count()
             .rename(columns={"timestamp": "attractors"})
         )
+        if len(count_df) == 0:
+            return pd.DataFrame(columns=self.key_list + ["model", "attractors"])
         merged_df = (
             count_df.reset_index()
             .set_index(self.key_list)
@@ -219,6 +224,8 @@ class BendersAnalysis:
         merged_df["attractors"] = (merged_df["attractors"]  - merged_df["attractors"].shift(-1).fillna(0)).astype(int)
         merged_df = merged_df[merged_df["attractors"] > 0]
         merged_df.drop(["sol","level"], axis=1, inplace=True)
+        merged_df = merged_df.rename(columns={"model_num": "model"})
+        merged_df["model"] = merged_df["model"].astype(int)
         return merged_df[merged_df["attractors"] > 0]
 
     @property
