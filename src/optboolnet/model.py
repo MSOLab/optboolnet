@@ -690,15 +690,11 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
         """y[i,c,t] is the truth value of clause c of variable i at time t.
         y[i,c,0] is the periodicity reference: y[i,c,0] = y[i,c,T*] where T* is the attractor length."""
         self.p = pmoenv.ScalarVar(domain=pmoenv.Binary)
-        """p = 1 iff the phenotype is satisfied at every active time step"""
+        """p = 1 iff the phenotype is satisfied at all times t in [1..T_max]"""
         self.w = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
-        """w[t] = 1 iff the attractor length is exactly t (eq:agg-llp-w-sum)"""
-        self.o = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
-        """o[t] = 1 iff time t is within the attractor, i.e. t <= T* (eq:agg-llp-w-connect-o)"""
-        self.p_bar = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
-        """p_bar[t] = 1 iff the phenotype is violated at active time t (eq:agg-llp-ph-2)"""
+        """w[t] = 1 iff the attractor length is exactly t (eq:llp-w-sum)"""
         self.append_vars_to_solvers(
-            [self.x, self.y, self.p, self.w, self.o, self.p_bar]
+            [self.x, self.y, self.p, self.w]
         )
 
         ### ======== constraints
@@ -713,51 +709,30 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
         """"""
 
     def make_constr_phenotype_and_length(self):
-        """Constraints for length selection (w, o) and phenotype satisfaction (p_bar, p).
+        """Constraints for length selection (w) and phenotype indicator p.
 
-        Implements eq:agg-llp-w-sum through eq:agg-llp-ph-1.
+        Implements eq:llp-w-sum and eq:llp-ph-ub/eq:llp-ph from ijoc_formulation.tex.
         """
         self.clear_constr_list(self.constrs_phenotype)
 
-        # sum(w) = 1: exactly one attractor length is selected (eq:agg-llp-w-sum)
+        # sum(w) = 1: exactly one attractor length is selected (eq:llp-w-sum)
         self.add_constr_to_list(
             pmoenv.summation(self.w) == 1,
             self.constrs_phenotype,
         )
 
-        # o[t] = sum(w[t'] for t' >= t): o[t]=1 iff t is an active time step (eq:agg-llp-w-connect-o)
+        # p <= x_phi,t for all t (eq:llp-ph-ub)
         for t in self.T_range:
             self.add_constr_to_list(
-                self.o[t]
-                == pmoenv.quicksum(self.w[t_] for t_ in self.T_range if t_ >= t),
+                self.p <= self.x[self.bn.phenotype, t],
                 self.constrs_phenotype,
             )
 
-        # p_bar[t] = o[t] * (1 - x[phi,t]): phenotype violated at active time t (eq:agg-llp-ph-2)
-        for t in self.T_range:
-            self.add_constr_to_list(
-                self.p_bar[t] <= self.o[t],
-                self.constrs_phenotype,
-            )
-            self.add_constr_to_list(
-                self.p_bar[t] <= 1 - self.x[self.bn.phenotype, t],
-                self.constrs_phenotype,
-            )
-            self.add_constr_to_list(
-                self.p_bar[t] >= self.o[t] - self.x[self.bn.phenotype, t],
-                self.constrs_phenotype,
-            )
-
-        # p <= 1 - p_bar[t]: if phenotype violated at any active time, p=0 (eq:agg-llp-ph-1)
-        for t in self.T_range:
-            self.add_constr_to_list(
-                self.p <= 1 - self.p_bar[t],
-                self.constrs_phenotype,
-            )
-
-        # p >= 1 - sum(p_bar): if phenotype satisfied at all active times, p=1 (eq:agg-llp-ph-3)
+        # p >= 1 - sum_t (1 - x_phi,t) (eq:llp-ph)
         self.add_constr_to_list(
-            self.p >= 1 - pmoenv.summation(self.p_bar),
+            self.p
+            >= 1
+            - pmoenv.quicksum(1 - self.x[self.bn.phenotype, t] for t in self.T_range),
             self.constrs_phenotype,
         )
 
@@ -835,18 +810,12 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
     def fix_length(self, T: int):
         """Parameterize this model as the T-th LLP by fixing w_T=1 and w_t=0 for t != T.
 
-        With w fixed, the aggregated constraints simplify (per the paper's appendix):
-          - o_t = 1  for all t in [T]  (fixed explicitly here)
-          - p_bar_t = 1 - x[phi,t]  for t in [T]  (follows from o_t=1 via constraints)
-          - y[c,0] = y[c,T]  (enforced by periodicity constraints with w[T]=1)
-        which is equivalent to eq:llp-phenotype-1 and eq:llp-phenotype-2.
-
-        Assumes this model was built with max_length == T so that T_range = range(1, T+1),
-        meaning every t in T_range satisfies t <= T and hence o_t = 1.
+        Assumes this model was built with max_length == T so T_range = [1..T].
+        Then w[T]=1 and periodicity constraints enforce y[c,0] = y[c,T], making
+        this equivalent to the fixed-length subproblem \LLPModelAtT.
         """
         for t in self.T_range:
             self.fix_var(self.w[t], 1 if t == T else 0)
-            self.fix_var(self.o[t], 1)
 
     def set_phenotype_obj(self, _minimize: bool = True):
         self.set_objective(expr=self.p, _minimize=_minimize)

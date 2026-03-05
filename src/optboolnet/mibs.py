@@ -289,12 +289,11 @@ class MibSAggBilevelIP(MasterControlIP):
     """Aggregated bilevel model using a single LLP with w[t] length selector.
 
     Replaces the extensive-form T separate LLPs in MibSBilevelIP with one
-    aggregated LLP that selects attractor length via w[t]. A scalar v variable
-    handles the case where no valid attractor exists (v=1 → infeasibility relaxation),
-    making the LLP always feasible regardless of the control d.
+    aggregated LLP that selects attractor length via w[t].
 
-    ULP: min sum(d), s.t. p + v >= 1  [rational reaction constraint]
-    LLP: min p + 2v, s.t. aggregated stability/phenotype/periodicity constraints
+    This class follows the final bilevel model in ijoc_formulation.tex:
+      ULP: min sum(d), s.t. LLP.p == 1
+      LLP: min p, s.t. aggregated stability/phenotype/periodicity constraints
     """
 
     def __init__(
@@ -326,50 +325,28 @@ class MibSAggBilevelIP(MasterControlIP):
         self.LLP.y = pmoenv.Var(self.C * self.T_range_0, domain=pmoenv.Binary)
         """y[i,c,t] = clause c of gene i satisfied at t; y[i,c,0] is periodicity reference"""
         self.LLP.p = pmoenv.ScalarVar(domain=pmoenv.Binary)
-        """p=1 iff phenotype satisfied at every active time step"""
-        self.LLP.v = pmoenv.ScalarVar(domain=pmoenv.Binary)
-        """v=1 iff no valid attractor exists (infeasibility slack)"""
+        """p=1 iff phenotype satisfied at all times t in [1..T_max]"""
         self.LLP.w = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
         """w[t]=1 iff attractor length is exactly t"""
-        self.LLP.o = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
-        """o[t]=1 iff time step t is active (t <= selected length)"""
-        self.LLP.p_bar = pmoenv.Var(self.T_range, domain=pmoenv.Binary)
-        """p_bar[t]=1 iff phenotype violated at active time t"""
 
-        ### ======== ULP constraint: rational reaction (linking)
+        ### ======== ULP coupling: enforce p = 1 at bilevel optimum
         self.constrs_phenotype = pmoenv.ConstraintList()
-        self.constrs_phenotype.add(self.LLP.p + self.LLP.v >= 1)
+        self.constrs_phenotype.add(self.LLP.p == 1)
 
         ### ======== LLP constraints
         self.LLP.constrs_phenotype = pmoenv.ConstraintList()
 
-        # sum(w) + v = 1: exactly one length selected OR infeasibility (v=1)
+        # sum_t w[t] = 1 (eq:llp-w-sum)
+        self.LLP.constrs_phenotype.add(pmoenv.summation(self.LLP.w) == 1)
+
+        # p <= x_phi,t for all t (eq:llp-ph-ub)
+        for t in self.T_range:
+            self.LLP.constrs_phenotype.add(self.LLP.p <= self.LLP.x[self.bn.phenotype, t])
+        # p >= 1 - sum_t (1 - x_phi,t) (eq:llp-ph)
         self.LLP.constrs_phenotype.add(
-            pmoenv.summation(self.LLP.w) + self.LLP.v == 1
-        )
-
-        # o[t] = sum(w[t'] for t' >= t): cumulative sum from right
-        for t in self.T_range:
-            self.LLP.constrs_phenotype.add(
-                self.LLP.o[t]
-                == pmoenv.quicksum(self.LLP.w[t_] for t_ in self.T_range if t_ >= t)
-            )
-
-        # p_bar[t] = o[t] * (1 - x[phi,t]): phenotype violated at active time t
-        for t in self.T_range:
-            self.LLP.constrs_phenotype.add(self.LLP.p_bar[t] <= self.LLP.o[t])
-            self.LLP.constrs_phenotype.add(
-                self.LLP.p_bar[t] <= 1 - self.LLP.x[self.bn.phenotype, t]
-            )
-            self.LLP.constrs_phenotype.add(
-                self.LLP.p_bar[t] >= self.LLP.o[t] - self.LLP.x[self.bn.phenotype, t]
-            )
-
-        # p <= 1 - p_bar[t]; p >= 1 - sum(p_bar)
-        for t in self.T_range:
-            self.LLP.constrs_phenotype.add(self.LLP.p <= 1 - self.LLP.p_bar[t])
-        self.LLP.constrs_phenotype.add(
-            self.LLP.p >= 1 - pmoenv.summation(self.LLP.p_bar)
+            self.LLP.p
+            >= 1
+            - pmoenv.quicksum(1 - self.LLP.x[self.bn.phenotype, t] for t in self.T_range)
         )
 
         # periodicity: y[i,c,0] = y[i,c,T*] enforced by w[T*]=1
@@ -386,11 +363,11 @@ class MibSAggBilevelIP(MasterControlIP):
         # stability: controllability, transitions, literals
         self.LLP.constrs_stability = pmoenv.ConstraintList()
 
-        # controllability: d[j,1] - v <= x[j,t]; d[j,0] <= 1 - x[j,t]
+        # controllability: d[j,1] <= x[j,t]; d[j,0] <= 1 - x[j,t]
         for j in self.J:
             for t in self.T_range:
                 self.LLP.constrs_stability.add(
-                    self.d[j, 1] - self.LLP.v <= self.LLP.x[j, t]
+                    self.d[j, 1] <= self.LLP.x[j, t]
                 )
                 self.LLP.constrs_stability.add(
                     self.d[j, 0] <= 1 - self.LLP.x[j, t]
@@ -412,7 +389,7 @@ class MibSAggBilevelIP(MasterControlIP):
                     - (d_0 + d_1)
                 )
 
-        # literal constraints: positive literals unchanged; negative literals relaxed by v
+        # literal constraints: clause-literal synchronization (eq:llp-literal-1~3)
         for (i, c), clause in self.bn.iter_clauses():
             for t in self.T_range:
                 x_lit_list = [self.LLP.x[i_, t] for i_ in clause.pos_literals] + [
@@ -424,20 +401,18 @@ class MibSAggBilevelIP(MasterControlIP):
                     )
                 for i_ in clause.neg_literals:
                     self.LLP.constrs_stability.add(
-                        self.LLP.y[i, c, t] >= 1 - self.LLP.x[i_, t] - self.LLP.v
+                        self.LLP.y[i, c, t] >= 1 - self.LLP.x[i_, t]
                     )
                 self.LLP.constrs_stability.add(self.LLP.y[i, c, t] <= sum(x_lit_list))
 
         self.constrs_no_good_x = pmoenv.ConstraintList()
 
-        ### ======== LLP objective
-        self.LLP.obj = pmoenv.Objective(
-            expr=self.LLP.p + 2 * self.LLP.v
-        )
+        ### ======== LLP objective (eq:llp-obj)
+        self.LLP.obj = pmoenv.Objective(expr=self.LLP.p)
 
     def not_allow_empty_attractor(self):
-        """Force v=0 so the LLP must find a real attractor (no infeasibility slack)."""
-        self.constrs_phenotype.add(self.LLP.v == 0)
+        """No-op: this formulation has no v-relaxation variable."""
+        pass
 
     def optimize(self):
         return _run_mibs(self)

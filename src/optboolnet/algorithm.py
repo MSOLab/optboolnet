@@ -135,7 +135,7 @@ class BendersAttractorControl(AttractorControl):
         self.use_aggregated_LLP: bool = False
         """If true, build max_length parameterized AggregatedAttractorDetectionIP models (one per length)
         instead of ExtendedAttractorDetectionIP models. Each is derived from the aggregated formulation
-        by calling fix_length(T), which fixes w_T=1 and o_t=1 for all t."""
+        by calling fix_length(T), which fixes w_T=1."""
 
     def validate_config(self):
         if (self.max_length != 1) and self.use_high_point_relaxation:
