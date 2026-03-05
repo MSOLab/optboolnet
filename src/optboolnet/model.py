@@ -13,6 +13,15 @@ import pyomo.environ as pmoenv
 # TODO: lazy cut implementation for persistent solvers
 
 
+def _as_binary(expr) -> int:
+    """Convert a Pyomo numeric expression/value to a binary int via 0.5 threshold."""
+    return 1 if pmoenv.value(expr) > 0.5 else 0
+
+
+def _is_true(expr) -> bool:
+    return _as_binary(expr) == 1
+
+
 class LiteralCounter(Iterator):
     def __init__(self, gen: Generator):
         self.gen = iter(gen)
@@ -98,6 +107,8 @@ class CoreIP(pmoenv.ConcreteModel):
         self.set_objective(1)
         self.dummy_zero = pmoenv.ScalarVar(domain=[0, 0])
         self.append_vars_to_solvers([self.dummy_zero])
+        self.last_termination_condition = None
+        self.last_solver_status = None
 
     def update_options_time_limit(self, time_limit: Optional[float]):
         self.solver.options["time_limit"] = time_limit
@@ -166,6 +177,8 @@ class CoreIP(pmoenv.ConcreteModel):
             results: SolverResults = self.solver.solve(**self.solver_config.kwgs)
         else:
             results = self.solver.solve(self, **self.solver_config.kwgs)
+        self.last_termination_condition = results.solver.termination_condition
+        self.last_solver_status = results.solver.status
 
         if to_optimum:  # check the optimality
             return results.solver.termination_condition == TerminationCondition.optimal
@@ -223,9 +236,9 @@ class MasterControlIP(CoreIP):
     def get_control(self) -> Control:
         ctrl_dict = dict()
         for j in self.J:
-            if pmoenv.value(self.d[j, 0]) == 1:
+            if _is_true(self.d[j, 0]):
                 ctrl_dict[j] = 0
-            elif pmoenv.value(self.d[j, 1]) == 1:
+            elif _is_true(self.d[j, 1]):
                 ctrl_dict[j] = 1
             # else: ctrl[j] = Hypercube.FREE
         return Control(ctrl_dict)
@@ -370,9 +383,9 @@ class InterdictMasterControlIP(CoreIP):
     def get_control(self) -> Control:
         ctrl_dict = dict()
         for j in self.J:
-            if pmoenv.value(self.d[j, 0]) > 0.5:
+            if _is_true(self.d[j, 0]):
                 ctrl_dict[j] = 0
-            elif pmoenv.value(self.d[j, 1]) > 0.5:
+            elif _is_true(self.d[j, 1]):
                 ctrl_dict[j] = 1
         return Control(ctrl_dict)
 
@@ -535,20 +548,23 @@ class AttractorDetectionIP(MasterControlIP):
         """
         unique_state_seq: List[List[int]] = list()
         for t in self.T_range:
-            new_state = [int(self.x[i, t].value) for i in self.I]
+            new_state = [_as_binary(self.x[i, t]) for i in self.I]
             if all(new_state != _state for _state in unique_state_seq):
                 unique_state_seq.append(new_state)
             else:
                 break
-        x_1 = [self.x[j, 1].value for j in self.J]
+        x_1 = [_as_binary(self.x[j, 1]) for j in self.J]
         alpha = [
-            all(self.x[j, 1].value == self.x[j, t].value for t in self.T_range)
+            all(
+                _as_binary(self.x[j, 1]) == _as_binary(self.x[j, t])
+                for t in self.T_range
+            )
             for j in self.J
         ]
         beta = [
             all(
-                (self.x[j, t].value == 1)
-                == all(self.y[j, c, self.prev(t)].value == 1 for c in self.C_i[j])
+                _is_true(self.x[j, t])
+                == all(_is_true(self.y[j, c, self.prev(t)]) for c in self.C_i[j])
                 for t in self.T_range
             )
             for j in self.J
@@ -837,23 +853,26 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
 
     def get_attractor(self) -> Attractor:
         """Extract the attractor determined by the w selection."""
-        T_star = next(t for t in self.T_range if pmoenv.value(self.w[t]) > 0.5)
+        T_star = next(t for t in self.T_range if _is_true(self.w[t]))
         unique_state_seq: List[List[int]] = list()
         for t in range(1, T_star + 1):
-            new_state = [int(self.x[i, t].value) for i in self.I]
+            new_state = [_as_binary(self.x[i, t]) for i in self.I]
             if all(new_state != _state for _state in unique_state_seq):
                 unique_state_seq.append(new_state)
             else:
                 break
-        x_1 = [self.x[j, 1].value for j in self.J]
+        x_1 = [_as_binary(self.x[j, 1]) for j in self.J]
         alpha = [
-            all(self.x[j, 1].value == self.x[j, t].value for t in range(1, T_star + 1))
+            all(
+                _as_binary(self.x[j, 1]) == _as_binary(self.x[j, t])
+                for t in range(1, T_star + 1)
+            )
             for j in self.J
         ]
         beta = [
             all(
-                (self.x[j, t].value == 1)
-                == all(self.y[j, c, t - 1].value == 1 for c in self.C_i[j])
+                _is_true(self.x[j, t])
+                == all(_is_true(self.y[j, c, t - 1]) for c in self.C_i[j])
                 for t in range(1, T_star + 1)
             )
             for j in self.J
@@ -963,9 +982,9 @@ class TrapSpaceDetectionIP(MasterControlIP):
     def get_trap_space(self) -> Hypercube:
         trap_space = Hypercube()
         for i in self.I:
-            if self.h[i, 0].value == 1:
+            if _is_true(self.h[i, 0]):
                 trap_space[i] = 0
-            elif self.h[i, 1].value == 1:
+            elif _is_true(self.h[i, 1]):
                 trap_space[i] = 1
         return trap_space
 

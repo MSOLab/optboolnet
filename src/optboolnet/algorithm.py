@@ -3,6 +3,7 @@ from typing import Dict, List, Callable, Optional
 from optboolnet import CNFBooleanNetwork, Control
 from optboolnet.boolnet import Attractor
 from optboolnet.exception import InvalidConfigError
+from pyomo.opt import TerminationCondition
 from optboolnet.model import (
     Model,
     CoreIP,
@@ -88,6 +89,8 @@ class AttractorControl:
         # update_options_time_limit
         if _time_limit != None:
             if (_time_limit != None) and (_time_limit < 0):
+                # Mirror Pyomo semantics for downstream status handling.
+                problem.last_termination_condition = TerminationCondition.maxTimeLimit
                 return False
             else:
                 problem.update_options_time_limit(_time_limit)
@@ -285,7 +288,16 @@ class BendersAttractorControl(AttractorControl):
             )
             return True
         else:
-            return False
+            term = getattr(self.model_separation, "last_termination_condition", None)
+            if term == TerminationCondition.infeasible:
+                return False
+            if term == TerminationCondition.maxTimeLimit:
+                # Unknown separation status at timeout: never accept this candidate.
+                if self.total_time_limit is not None:
+                    self.total_time_limit = min(self.total_time_limit, self.elapsed_time)
+                return True
+            # Any other non-optimal status is unknown for correctness; block acceptance.
+            return True
 
     def is_LLP_violated(self, ctrl: Control) -> bool:
         """Finds a forbidden attractor and adds a constraint that cuts off the candidate if one exists
@@ -303,10 +315,23 @@ class BendersAttractorControl(AttractorControl):
             LLP_model.fix_control(ctrl)
             if self._optimize(LLP_model):
                 is_feasible = True
-                if LLP_model.p.value == 0:
+                if LLP_model.p.value < 0.5:
                     attr = LLP_model.get_attractor()
                     self._append_cut(self.model_master.append_logical_benders_cut, attr)
                     return True
+                continue
+
+            term = getattr(LLP_model, "last_termination_condition", None)
+            if term == TerminationCondition.infeasible:
+                continue
+            if term == TerminationCondition.maxTimeLimit:
+                # Unknown LLP status at timeout: never accept this candidate.
+                if self.total_time_limit is not None:
+                    self.total_time_limit = min(self.total_time_limit, self.elapsed_time)
+                return True
+            # Any other non-optimal status is unknown for correctness; block acceptance.
+            return True
+
         if is_feasible or self.allow_empty_attractor:
             return False
         else:
