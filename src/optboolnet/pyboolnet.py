@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import time
 from itertools import combinations, product
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from optboolnet.boolnet import CNFBooleanNetwork, Control
 from optboolnet.config import LoggingConfig
-from optboolnet.log import BendersLogger
+from optboolnet.log import BendersLogger, EnumCutType
 
 _PYBOOLNET_IMPORT_ERROR: Optional[Exception] = None
 try:
@@ -29,6 +30,30 @@ except Exception as exc:  # pragma: no cover - import guard only
     _PYBOOLNET_IMPORT_ERROR = exc
 
 log = logging.getLogger(__name__)
+
+# NuSMV reserved keywords; if a BN variable collides, PyBoolNet model_checking
+# fails while generating SMV. Keep this local to avoid importing checking.py.
+_NUSMV_RESERVED_LOWER = frozenset(
+    x.lower()
+    for x in [
+        "MODULE", "DEFINE", "MDEFINE", "CONSTANTS", "VAR", "IVAR", "FROZENVAR",
+        "ASSIGN", "TRANS", "INIT", "INVAR", "SPEC", "CTLSPEC", "LTLSPEC",
+        "PSLSPEC", "COMPUTE", "INVARSPEC", "FAIRNESS", "JUSTICE", "COMPASSION",
+        "ISA", "CONSTRAINT", "SIMPWFF", "CTLWFF", "LTLWFF", "PSLWFF", "COMPWFF",
+        "MAX", "MIN",
+        "IN", "UNION",
+        "BOOLEAN", "INTEGER", "REAL", "WORD", "WORD1", "BOOL",
+        "SIGNED", "UNSIGNED", "ARRAY", "OF",
+        "COUNT", "EXTEND", "RESIZE", "SIZEOF", "TOINT", "SWCONST",
+        "CASE", "ESAC",
+        "NEXT", "SELF", "PROCESS",
+        "TRUE", "FALSE",
+        "EBF", "EBG", "ABF", "ABG",
+        "mod", "union", "in", "xor", "xnor", "case", "esac", "next", "init",
+        "process", "array", "of", "boolean", "integer", "real", "word", "self",
+        "count", "extend", "resize", "sizeof", "toint", "signed", "unsigned",
+    ]
+)
 
 
 def _require_pyboolnet() -> None:
@@ -55,6 +80,51 @@ def efag_set_of_subspaces(primes: dict, subspaces: List[Dict[str, int]]) -> str:
     return "EF(AG(" + " | ".join(subspace2proposition(primes, x) for x in subspaces) + "))"
 
 
+def _to_nusmv_safe_name(name: str, used: set[str]) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not candidate or not candidate[0].isalpha():
+        candidate = f"v_{candidate}"
+    if len(candidate) < 2:
+        candidate = f"v_{candidate}"
+    if candidate.lower() in _NUSMV_RESERVED_LOWER:
+        candidate = f"v_{candidate}"
+    base = candidate
+    suffix = 1
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _rename_primes_and_target_for_nusmv(
+    primes: dict, target: List[Dict[str, int]]
+) -> Tuple[dict, List[Dict[str, int]]]:
+    # NuSMV used by PyBoolNet rejects 1-char variable names (e.g., "p").
+    # Keep the original names everywhere else and only rename in model checking.
+    rename_map: Dict[str, str] = {}
+    used: set[str] = set()
+    requires_rename = False
+    for var in primes.keys():
+        safe = _to_nusmv_safe_name(var, used)
+        rename_map[var] = safe
+        if safe != var:
+            requires_rename = True
+
+    if not requires_rename:
+        return primes, target
+
+    renamed_primes = {}
+    for var, val in primes.items():
+        zero_implicants, one_implicants = val
+        renamed_zero = [{rename_map[k]: v for k, v in imp.items()} for imp in zero_implicants]
+        renamed_one = [{rename_map[k]: v for k, v in imp.items()} for imp in one_implicants]
+        renamed_primes[rename_map[var]] = [renamed_zero, renamed_one]
+
+    renamed_target = [{rename_map[k]: v for k, v in sub.items()} for sub in target]
+    return renamed_primes, renamed_target
+
+
 def fix_components_and_reduce(
     primes: dict, subspace: Dict[str, int], keep_vars: List[str]
 ) -> dict:
@@ -64,8 +134,9 @@ def fix_components_and_reduce(
 
 
 def run_control_query(primes: dict, target: List[Dict[str, int]], update: str) -> bool:
-    spec = "CTLSPEC " + efag_set_of_subspaces(primes, target)
-    return bool(model_checking(primes, update, "INIT TRUE", spec))
+    mc_primes, mc_target = _rename_primes_and_target_for_nusmv(primes, target)
+    spec = "CTLSPEC " + efag_set_of_subspaces(mc_primes, mc_target)
+    return bool(model_checking(mc_primes, update, "INIT TRUE", spec))
 
 
 def reduce_and_run_control_query(
@@ -165,6 +236,8 @@ def compute_control_strategies_with_model_checking(
     starting_length: int = 0,
     known_strategies: Optional[List[Dict[str, int]]] = None,
     time_limit: Optional[float] = None,
+    on_control_found: Optional[Callable[[Dict[str, int], int, str, float], None]] = None,
+    on_size_finished: Optional[Callable[[int, bool], None]] = None,
 ) -> List[Dict[str, int]]:
     if not isinstance(target, list):
         raise TypeError("target must be a list of subspaces.")
@@ -192,11 +265,14 @@ def compute_control_strategies_with_model_checking(
             break
         target_size = i + len(common_vars_in_cs)
         log.info("Checking control strategies of size %d", target_size)
+        completed_size = True
         for var_subset in combinations(candidate_variables, i):
             if _timed_out(search_start, time_limit):
+                completed_size = False
                 break
             for values in product((0, 1), repeat=i):
                 if _timed_out(search_start, time_limit):
+                    completed_size = False
                     break
                 candidate = dict(zip(var_subset, values))
                 candidate.update(common_vars_in_cs)
@@ -206,9 +282,12 @@ def compute_control_strategies_with_model_checking(
 
                 perc = find_constants(primes=percolate(primes=primes, add_constants=candidate, copy=True))
                 perc_key = _subspace_key(perc)
+                check_st = time.time()
 
                 if perc_key in perc_true_keys:
                     list_strategies.append(candidate)
+                    if on_control_found is not None:
+                        on_control_found(candidate, target_size, "CACHE_TRUE", time.time() - check_st)
                     continue
                 if perc_key in perc_false_keys:
                     continue
@@ -216,13 +295,23 @@ def compute_control_strategies_with_model_checking(
                 if control_direct_percolation(primes, candidate, target):
                     perc_true_keys.add(perc_key)
                     list_strategies.append(candidate)
+                    if on_control_found is not None:
+                        on_control_found(candidate, target_size, "PERCOLATION", time.time() - check_st)
                 elif control_model_checking(
                     primes, candidate, target, update, max_output_trapspaces=max_output_trapspaces
                 ):
                     perc_true_keys.add(perc_key)
                     list_strategies.append(candidate)
+                    if on_control_found is not None:
+                        on_control_found(candidate, target_size, "MODEL_CHECKING", time.time() - check_st)
                 else:
                     perc_false_keys.add(perc_key)
+
+        if on_size_finished is not None:
+            on_size_finished(target_size, completed_size)
+        if not completed_size:
+            log.warning("PyBoolNet control search reached time limit.")
+            break
 
     return list_strategies
 
@@ -256,10 +345,45 @@ class PyBoolNetAttractorControl:
         self.name = name
         self.bn = bn
         self.logger = BendersLogger(logging_config)
+        self.start_time = time.time()
         self.total_time_limit: Optional[float] = None
         self.update: str = "synchronous"
         self.max_output_trapspaces: int = 1000000
         self.solution_dict: Dict[int, List[Control]] = {}
+        self._found_keys: set[Tuple[Tuple[str, int], ...]] = set()
+
+    @property
+    def elapsed_time(self) -> float:
+        return time.time() - self.start_time
+
+    def _log_build(self, model_name: str, build_time: float) -> None:
+        if self.logger.is_on:
+            self.logger.build_logger.info(
+                f"{self.elapsed_time:.3f},{self.name},0,BUILD_MODEL,{model_name},{build_time:.3f}"
+            )
+
+    def _log_found_control(
+        self, candidate: Dict[str, int], target_size: int, method: str, solve_time: float
+    ) -> None:
+        ctrl = Control({k: int(v) for k, v in candidate.items() if k in self.bn.controllable_vars})
+        key = tuple(sorted(ctrl.items()))
+        if key in self._found_keys:
+            return
+        self._found_keys.add(key)
+        if self.logger.is_on:
+            self.logger.solve_logger.info(
+                f"{self.elapsed_time:.3f},{self.name},{target_size},LOWER_LEVEL_PROBLEM,"
+                f"'PBN_{method}',{solve_time:.3f},True"
+            )
+            self.logger.cut_logger.info(
+                f"{self.elapsed_time:.3f},{self.name},{target_size},LOWER_LEVEL_PROBLEM,"
+                f"{EnumCutType.MINIMALITY.name},{len(ctrl)}"
+            )
+
+    def _log_size_finished(self, target_size: int, completed: bool) -> None:
+        if (not completed) or (not self.logger.is_on):
+            return
+        self.logger.solve_logger_info(f"{self.elapsed_time:.3f},{self.name},{target_size},FINISHED")
 
     def _group_controls(
         self, strategies: List[Dict[str, int]], max_control_size: int
@@ -292,7 +416,9 @@ class PyBoolNetAttractorControl:
         if avoid_nodes is None:
             avoid_nodes = list(self.bn.uncontrollable_vars) + list(self.bn.fixed_values.keys())
 
+        build_st = time.time()
         primes = make_primes_from_bn(self.bn)
+        self._log_build("PBN_PRIMES", time.time() - build_st)
         strategies = compute_control_strategies_with_model_checking(
             primes=primes,
             target=target_subspaces,
@@ -303,6 +429,8 @@ class PyBoolNetAttractorControl:
             starting_length=starting_length,
             known_strategies=known_strategies,
             time_limit=self.total_time_limit,
+            on_control_found=self._log_found_control,
+            on_size_finished=self._log_size_finished,
         )
 
         self.solution_dict = self._group_controls(strategies, max_control_size)
