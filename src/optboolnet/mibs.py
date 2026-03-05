@@ -5,6 +5,8 @@ from pao.mpr.solvers.mibs import LinearMultilevelSolver_MIBS
 from pao.pyomo.solver import convert_pyomo2MultilevelProblem, PyomoSubmodelResults
 from pao.pyomo import SubModel
 import os
+import shutil
+import tempfile
 from optboolnet import CNFBooleanNetwork
 
 from optboolnet.boolnet import CNFBooleanNetwork, Control
@@ -86,28 +88,56 @@ def _run_mibs(model: MasterControlIP, extra_options: Optional[Dict[str, int]] = 
         if save_lp_path:
             _save_bilevel_model(model, save_lp_path)
 
-        temp_mps, temp_aux = "mibs_temp.mps", "mibs_temp.aux"
-        mpr_solver.create_mibs_model(lmp, temp_mps, temp_aux)
+        keep_temp = getattr(model.solver_config, "keep_temp", False)
+        mibs_work_dir = tempfile.mkdtemp(prefix="mibs_work_")
+        mps_fd, temp_mps = tempfile.mkstemp(prefix="mibs_temp_", suffix=".mps", dir=mibs_work_dir)
+        aux_fd, temp_aux = tempfile.mkstemp(prefix="mibs_temp_", suffix=".aux", dir=mibs_work_dir)
+        os.close(mps_fd)
+        os.close(aux_fd)
+        prev_cwd = os.getcwd()
+        executable = model.solver_config.executable
+        if not os.path.isabs(executable):
+            executable = os.path.abspath(os.path.join(prev_cwd, executable))
+        try:
+            # PAO's create_mibs_model uses hard-coded tmp file names in CWD.
+            # Use a per-run temp directory to avoid collisions across processes.
+            os.chdir(mibs_work_dir)
+            mpr_solver.create_mibs_model(lmp, temp_mps, temp_aux)
 
-        # Build MibS command; pass remaining wall-clock time as an internal limit
-        # so MibS can report partial results before the process is killed externally.
-        cmd = [model.solver_config.executable, "-Alps_instance", temp_mps]
-        if extra_options:
-            for key, val in extra_options.items():
-                cmd += [f"-{key}", str(val)]
-        time_limit = model.solver.options.get("time_limit", None)
-        if time_limit is not None:
-            cmd += ["-Alps_timeLimit", str(int(max(1, time_limit)))]
+            # Build MibS command; pass remaining wall-clock time as an internal limit
+            # so MibS can report partial results before the process is killed externally.
+            cmd = [
+                executable,
+                "-Alps_instance",
+                temp_mps,
+                "-MibS_auxiliaryInfoFile",
+                temp_aux,
+            ]
+            if extra_options:
+                for key, val in extra_options.items():
+                    cmd += [f"-{key}", str(val)]
+            time_limit = model.solver.options.get("time_limit", None)
+            if time_limit is not None:
+                cmd += ["-Alps_timeLimit", str(int(max(1, time_limit)))]
+            ans = run_shellcmd(cmd, tee=model.solver_config.tee, time_limit=time_limit)
+        finally:
+            os.chdir(prev_cwd)
+            # Optional: keep temp files for post-mortem inspection.
+            # Activated by setting solver_config.keep_temp = True.
+            if not keep_temp:
+                if os.path.exists(temp_mps):
+                    os.remove(temp_mps)
+                if os.path.exists(temp_aux):
+                    os.remove(temp_aux)
+                shutil.rmtree(mibs_work_dir, ignore_errors=True)
 
-        ans = run_shellcmd(cmd, tee=model.solver_config.tee, time_limit=time_limit)
+        log_lines = ans["log"].splitlines()
+        if "Optimal solution:" not in ans["log"]:
+            error_line = next((line.strip() for line in log_lines if line.strip().startswith("Error:")), None)
+            if error_line is not None:
+                raise RuntimeError(f"MibS execution error: {error_line}")
 
-        # Optional: keep temp files for post-mortem inspection.
-        # Activated by setting solver_config.keep_temp = True.
-        if not getattr(model.solver_config, "keep_temp", False):
-            os.remove(temp_mps)
-            os.remove(temp_aux)
-
-        line_iter = PrintIter(iter(ans["log"].split("\r\n")))
+        line_iter = PrintIter(iter(log_lines))
         _line = next(line_iter)
 
         lmp_results = Results()
@@ -669,7 +699,6 @@ class MibSAttractorControl(AttractorControl):
             self.model_bilevel.not_allow_empty_attractor()
         # main step
         for self.target_size in self.iter_target_size(self.max_control_size):
-            print(self.target_size)
             self.step = EnumBendersStep.FULL_BILEVEL
             _solution_list = list()
             self.model_bilevel.set_constr_target_size(self.target_size)
