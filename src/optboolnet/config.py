@@ -178,6 +178,15 @@ class BendersConfig(AttractorControlConfig):
     """If true, use AggregatedAttractorDetectionIP instead of ExtendedAttractorDetectionIP for each LLP."""
 
 
+class PyBoolNetConfig(AttractorControlConfig):
+    update: str = "synchronous"
+    """Update mode passed to PyBoolNet model checking ("synchronous", "asynchronous", "mixed")."""
+    max_output_trapspaces: int = 1000000
+    """Maximum number of minimal trap spaces to enumerate per candidate."""
+    starting_length: int = 0
+    """Smallest control size to start the search from."""
+
+
 class MibSBilevelConfig(AttractorControlConfig):
     enforce: bool
     use_valid_cuts: bool
