@@ -187,7 +187,7 @@ class BendersAttractorControl(AttractorControl):
             self.model_separation.set_objective_sparse_cut()
         else:
             self.model_separation = None
-        self.model_LLP_list = list()
+        self.model_LLP_list: list[AggregatedAttractorDetectionIP] = list()
         if self.use_aggregated_LLP:
             self.model_agg_LLP = self._build_model(
                 AggregatedAttractorDetectionIP,

@@ -205,6 +205,9 @@ class Attractor:
 
     def to_str_list(self):
         return ["".join([str(value) for value in state]) for state in self.value_list]
+    
+    def get_length(self):
+        return len(self.value_list)
 
 
 class Hypercube(_Hypercube):
