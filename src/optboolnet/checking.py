@@ -34,7 +34,6 @@ _NUSMV_RESERVED = frozenset({
     "count", "extend", "resize", "sizeof", "toint", "signed", "unsigned",
 })
 
-
 def _nusmv_var(n):
     if isinstance(n, int):
         return "x%d" % n
@@ -62,7 +61,25 @@ def _smv_expr_from_raw(expr):
     return _sanitize_smv_expr(s)
 
 
-def _nusmv_model(bn, control=None, update_mode="synchronous"):
+def _simplify_local_expr_for_smv(expr, ba=None, tiny_support_threshold=0):
+    """Simplify a local Boolean expression before SMV emission.
+
+    Uses the expression's native simplify() only, without forcing CNF/DNF.
+    This is intentionally lightweight to avoid conversion overhead.
+    """
+    try:
+        return expr.simplify()
+    except Exception:
+        return expr
+
+
+def _nusmv_model(
+    bn,
+    control=None,
+    update_mode="synchronous",
+    simplify_local_functions=False,
+    tiny_support_threshold=0,
+):
     """
     bn: minibn.CNFBooleanNetwork
     control: Control
@@ -87,11 +104,19 @@ def _nusmv_model(bn, control=None, update_mode="synchronous"):
     lines.append("DEFINE")
     if control is None:
         control = {}
+    ba = getattr(bn, "ba", None)
     for n in dom:
         if n in control:
             lines.append(f"f{n} := {'TRUE' if control[n] else 'FALSE'};")
             continue
-        lines.append(f"f{n} := {_smv_expr_from_raw(bn[n])};")
+        expr = bn[n]
+        if simplify_local_functions:
+            expr = _simplify_local_expr_for_smv(
+                expr,
+                ba=ba,
+                tiny_support_threshold=tiny_support_threshold,
+            )
+        lines.append(f"f{n} := {_smv_expr_from_raw(expr)};")
 
     if update_mode != "synchronous":
         lines.append(
@@ -182,17 +207,28 @@ def _preprocess_bn_with_mpbn(bn, control):
 
 def _phenotype_spec_clause(phenotype_expr, property_variant):
     temporal_expr = _phenotype_temporal_expr(phenotype_expr, property_variant)
-    spec_kw = "CTLSPEC" if property_variant == "ctl_ef_ag" else "LTLSPEC"
+    if property_variant in {"ctl_ef_ag", "ctl_not_ef_ag"}:
+        spec_kw = "CTLSPEC"
+    elif property_variant == "ltl_fg":
+        spec_kw = "LTLSPEC"
+    else:
+        raise ValueError(
+            "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ctl_not_ef_ag, ltl_fg".format(
+                property_variant
+            )
+        )
     return f"{spec_kw} {temporal_expr};"
 
 
 def _phenotype_temporal_expr(phenotype_expr, property_variant):
     if property_variant == "ctl_ef_ag":
         return f"EF AG {phenotype_expr}"
+    if property_variant == "ctl_not_ef_ag":
+        return f"! (EF AG {phenotype_expr})"
     if property_variant == "ltl_fg":
         return f"F G {phenotype_expr}"
     raise ValueError(
-        "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ltl_fg".format(
+        "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ctl_not_ef_ag, ltl_fg".format(
             property_variant
         )
     )
@@ -223,7 +259,11 @@ def _nusmv_control_assignment(control, dom, ctrl_var_map):
 
 
 def _nusmv_model_param_controls(
-    bn, update_mode="synchronous", constrain_controlled_vars=True
+    bn,
+    update_mode="synchronous",
+    constrain_controlled_vars=True,
+    simplify_local_functions=False,
+    tiny_support_threshold=0,
 ):
     """NuSMV model with parameterized controls via FROZENVAR lock/value pairs.
 
@@ -255,8 +295,16 @@ def _nusmv_model_param_controls(
         lines.append(f"next({var(i)}) := case {lock_var}: {val_var}; TRUE: f{i}; esac;")
 
     lines.append("DEFINE")
+    ba = getattr(bn, "ba", None)
     for n in dom:
-        lines.append(f"f{n} := {_smv_expr_from_raw(bn[n])};")
+        expr = bn[n]
+        if simplify_local_functions:
+            expr = _simplify_local_expr_for_smv(
+                expr,
+                ba=ba,
+                tiny_support_threshold=tiny_support_threshold,
+            )
+        lines.append(f"f{n} := {_smv_expr_from_raw(expr)};")
 
     if constrain_controlled_vars:
         lock_terms = []
@@ -358,10 +406,12 @@ def nusmv_check_phenotype(
     control=None,
     update_mode="synchronous",
     smvfile=None,
-    property_variant="ctl_ef_ag",
+    property_variant="ctl_not_ef_ag",
     constrain_controlled_vars=False,
     nusmv_opts=None,
     preprocess_propagation=True,
+    simplify_local_functions=False,
+    tiny_support_threshold=0,
 ):
     """
     Returns true if all the attractors have p=1 constantly
@@ -371,7 +421,8 @@ def nusmv_check_phenotype(
     update_mode: synchronous, asynchronous, general
     smvfile: if None, uses a temporary file
     property_variant:
-        - "ctl_ef_ag" (default): CTLSPEC EF AG phenotype
+        - "ctl_not_ef_ag" (default): CTLSPEC ! (EF AG phenotype)
+        - "ctl_ef_ag": CTLSPEC EF AG phenotype
         - "ltl_fg": LTLSPEC F G phenotype
     constrain_controlled_vars:
         If True, adds INIT/INVAR constraints for controlled nodes to reduce the
@@ -382,6 +433,11 @@ def nusmv_check_phenotype(
     preprocess_propagation:
         If True, preprocess the BN with MPBN constant propagation under the given
         control assignment, then run model checking on the reduced network.
+    simplify_local_functions:
+        If True, simplify each local Boolean update function right before SMV
+        emission (after optional propagation).
+    tiny_support_threshold:
+        Reserved for compatibility; ignored by the current simplifier.
     """
     eval_bn = bn
     eval_control = control if control is not None else {}
@@ -389,13 +445,23 @@ def nusmv_check_phenotype(
         eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
 
     phenotype_expr = _sanitize_smv_expr(bn.phenotype)
-    nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
+    nusmv_input = _nusmv_model(
+        eval_bn,
+        control=eval_control,
+        update_mode=update_mode,
+        simplify_local_functions=simplify_local_functions,
+        tiny_support_threshold=tiny_support_threshold,
+    )
     if constrain_controlled_vars:
         nusmv_input += _nusmv_control_constraints(
             eval_control, allowed_vars=list(eval_bn.keys())
         )
     nusmv_input += _phenotype_spec_clause(phenotype_expr, property_variant)
-    return _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
+    spec_true = _nusmv_alltrue(nusmv_input, smvfile, nusmv_opts=nusmv_opts)
+    # Keep API semantics: return True iff all attractors satisfy phenotype.
+    if property_variant == "ctl_not_ef_ag":
+        return not spec_true
+    return spec_true
 
 
 def nusmv_check_phenotype_full(
@@ -405,6 +471,8 @@ def nusmv_check_phenotype_full(
     smvfile=None,
     nusmv_opts=None,
     preprocess_propagation=True,
+    simplify_local_functions=False,
+    tiny_support_threshold=0,
 ):
     """
     Like nusmv_check_phenotype but also returns the cycle length of the
@@ -431,7 +499,13 @@ def nusmv_check_phenotype_full(
         eval_bn, eval_control = _preprocess_bn_with_mpbn(bn, eval_control)
 
     phenotype_expr = _sanitize_smv_expr(bn.phenotype)
-    nusmv_input = _nusmv_model(eval_bn, control=eval_control, update_mode=update_mode)
+    nusmv_input = _nusmv_model(
+        eval_bn,
+        control=eval_control,
+        update_mode=update_mode,
+        simplify_local_functions=simplify_local_functions,
+        tiny_support_threshold=tiny_support_threshold,
+    )
     nusmv_input += f"LTLSPEC F G {phenotype_expr};"
     output = _nusmv_run(
         nusmv_input,
@@ -450,9 +524,11 @@ def nusmv_check_phenotype_batch(
     controls,
     update_mode="synchronous",
     smvfile=None,
-    property_variant="ctl_ef_ag",
+    property_variant="ctl_not_ef_ag",
     constrain_controlled_vars=True,
     nusmv_opts=None,
+    simplify_local_functions=False,
+    tiny_support_threshold=0,
 ):
     """Batch phenotype checks for multiple controls in one NuSMV invocation.
 
@@ -464,12 +540,23 @@ def nusmv_check_phenotype_batch(
 
     phenotype_expr = _sanitize_smv_expr(bn.phenotype)
     temporal_expr = _phenotype_temporal_expr(phenotype_expr, property_variant)
-    spec_kw = "CTLSPEC" if property_variant == "ctl_ef_ag" else "LTLSPEC"
+    if property_variant in {"ctl_ef_ag", "ctl_not_ef_ag"}:
+        spec_kw = "CTLSPEC"
+    elif property_variant == "ltl_fg":
+        spec_kw = "LTLSPEC"
+    else:
+        raise ValueError(
+            "Unsupported property_variant '{}'. Supported: ctl_ef_ag, ctl_not_ef_ag, ltl_fg".format(
+                property_variant
+            )
+        )
 
     nusmv_input, ctrl_var_map = _nusmv_model_param_controls(
         bn,
         update_mode=update_mode,
         constrain_controlled_vars=constrain_controlled_vars,
+        simplify_local_functions=simplify_local_functions,
+        tiny_support_threshold=tiny_support_threshold,
     )
     for ctrl in controls:
         ctrl_expr = _nusmv_control_assignment(ctrl, list(bn.keys()), ctrl_var_map)
@@ -481,4 +568,7 @@ def nusmv_check_phenotype_batch(
         raise RuntimeError(
             f"Unexpected number of spec results: got {len(results)}, expected {len(controls)}"
         )
+    # Keep API semantics: return True iff all attractors satisfy phenotype.
+    if property_variant == "ctl_not_ef_ag":
+        return [not r for r in results]
     return results

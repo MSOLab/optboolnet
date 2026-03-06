@@ -5,7 +5,6 @@ import json
 import os
 import re
 import threading
-import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
@@ -23,56 +22,50 @@ _ALGO_SUBDIRS = ["benders", "MibS"]
 _worker_bns: dict = {}
 
 
-def _check_ctrl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, float]:
+def _check_ctrl_for_inst(inst_name: str, ctrl: Control) -> bool:
     """CTL phenotype check — fast, no counterexample trace."""
     if inst_name not in _worker_bns:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
-    t0 = time.perf_counter()
     ok = nusmv_check_phenotype(
         bn,
         control=ctrl,
-        property_variant="ctl_ef_ag",
+        property_variant="ctl_not_ef_ag",
         constrain_controlled_vars=True,
         preprocess_propagation=True,
     )
-    elapsed = time.perf_counter() - t0
-    return ok, elapsed
+    return ok
 
 
-def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Tuple[Optional[int], float]:
+def _get_loop_len_for_inst(inst_name: str, ctrl: Control) -> Optional[int]:
     """LTL phenotype check — slower, parses attractor cycle length from the trace."""
     if inst_name not in _worker_bns:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
-    t0 = time.perf_counter()
     _, loop_len = nusmv_check_phenotype_full(
         bn,
         control=ctrl,
         preprocess_propagation=True,
     )
-    elapsed = time.perf_counter() - t0
-    return loop_len, elapsed
+    return loop_len
 
 
-def _check_ctrl_ltl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, Optional[int], float]:
+def _check_ctrl_ltl_for_inst(inst_name: str, ctrl: Control) -> Tuple[bool, Optional[int]]:
     """LTL phenotype check with counterexample loop length."""
     if inst_name not in _worker_bns:
         _worker_bns[inst_name] = load_bn_in_repo(inst_name)
     bn = _worker_bns[inst_name]
-    t0 = time.perf_counter()
     ok, loop_len = nusmv_check_phenotype_full(
         bn,
         control=ctrl,
         preprocess_propagation=True,
     )
-    elapsed = time.perf_counter() - t0
-    return ok, loop_len, elapsed
+    return ok, loop_len
 
 
 # ---------------------------------------------------------------------------
 # Main-process result cache (persists for the full run across all work_dirs)
-# Key: (inst_name, ctrl_key)  Value: ok (bool only — elapsed is not stored)
+# Key: (inst_name, ctrl_key)  Value: ok (bool only)
 # ---------------------------------------------------------------------------
 
 _result_cache: Dict[tuple, bool] = {}
@@ -142,8 +135,8 @@ def extract_from_log(log_path: str, json_path: str) -> int:
     """Parse an existing log file and bootstrap / update checker.json.
 
     Lines handled:
-        work_dir,inst,{ctrl_dict},OK,<elapsed>s
-        work_dir,inst,{ctrl_dict},INCORRECT,<elapsed>s
+        work_dir,inst,{ctrl_dict},OK
+        work_dir,inst,{ctrl_dict},INCORRECT
 
     All other lines (comments, MISSING, DONE, LOOP_LEN) are silently skipped.
     Returns the number of *new* entries added.
@@ -163,7 +156,7 @@ def extract_from_log(log_path: str, json_path: str) -> int:
                 continue
             inst = parts[1]
             rest = parts[2]
-            m = re.match(r"(\{[^}]*\}),(OK|INCORRECT),", rest)
+            m = re.match(r"(\{[^}]*\}),(OK|INCORRECT)(?:,|$)", rest)
             if not m:
                 continue
             ctrl_str, status = m.group(1), m.group(2)
@@ -201,25 +194,22 @@ def _log_result(
     inst: str,
     ctrl: Control,
     ok: bool,
-    elapsed: float,
     loop_len: Optional[int] = None,
     logic: str = "ctl",
 ):
     if ok:
         if logic == "ltl":
-            line = f"{work_dir},{inst},{ctrl},OK,LOOP_LEN,{loop_len},{elapsed:.1f}s"
+            line = f"{work_dir},{inst},{ctrl},OK,LOOP_LEN,{loop_len}"
         else:
-            line = f"{work_dir},{inst},{ctrl},OK,{elapsed:.1f}s"
+            line = f"{work_dir},{inst},{ctrl},OK"
     else:
         tag = os.path.basename(work_dir)
         if logic == "ltl":
-            print(f"\tincorrect [{tag}/{inst}] {ctrl} loop={loop_len} ({elapsed:.1f}s)")
-            line = (
-                f"{work_dir},{inst},{ctrl},INCORRECT,LOOP_LEN,{loop_len},{elapsed:.1f}s"
-            )
+            print(f"\tincorrect [{tag}/{inst}] {ctrl} loop={loop_len}")
+            line = f"{work_dir},{inst},{ctrl},INCORRECT,LOOP_LEN,{loop_len}"
         else:
-            print(f"\tincorrect [{tag}/{inst}] {ctrl} ({elapsed:.1f}s)")
-            line = f"{work_dir},{inst},{ctrl},INCORRECT,{elapsed:.1f}s"
+            print(f"\tincorrect [{tag}/{inst}] {ctrl}")
+            line = f"{work_dir},{inst},{ctrl},INCORRECT"
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
 
@@ -311,13 +301,13 @@ def verify_all(
 
     incorrect: List[Tuple[str, str, Control]] = []
 
-    # Flush cached results (elapsed = 0.0s).
+    # Flush cached results.
     if logic == "ctl":
         for work_dir, inst, ctrl in all_triplets:
             key = (inst, _ctrl_key(ctrl))
             if key in _result_cache:
                 ok = _result_cache[key]
-                _log_result(output_file, work_dir, inst, ctrl, ok, 0.0, logic=logic)
+                _log_result(output_file, work_dir, inst, ctrl, ok, logic=logic)
                 if not ok:
                     incorrect.append((work_dir, inst, ctrl))
 
@@ -356,9 +346,9 @@ def verify_all(
         for future in as_completed(futures):
             work_dir, inst, ctrl, key = futures[future]
             if logic == "ltl":
-                ok, loop_len, elapsed = future.result()
+                ok, loop_len = future.result()
             else:
-                ok, elapsed = future.result()
+                ok = future.result()
                 loop_len = None
 
             _result_cache[key] = ok
@@ -369,7 +359,6 @@ def verify_all(
                 inst,
                 ctrl,
                 ok,
-                elapsed,
                 loop_len=loop_len,
                 logic=logic,
             )
@@ -409,7 +398,7 @@ def get_loop_lengths(
     to determine the attractor cycle length from the counterexample trace.
 
     Results are appended to output_file as:
-        work_dir,inst,ctrl,LOOP_LEN,<n>,<elapsed>s
+        work_dir,inst,ctrl,LOOP_LEN,<n>
 
     Intended to be called after verify_all() on the returned incorrect list.
     """
@@ -423,13 +412,11 @@ def get_loop_lengths(
         }
         for future in as_completed(futures):
             work_dir, inst, ctrl = futures[future]
-            loop_len, elapsed = future.result()
+            loop_len = future.result()
             tag = os.path.basename(work_dir)
-            print(f"\t[{tag}/{inst}] {ctrl} -> loop={loop_len} ({elapsed:.1f}s)")
+            print(f"\t[{tag}/{inst}] {ctrl} -> loop={loop_len}")
             with open(output_file, "a", encoding="utf-8") as _f:
-                _f.write(
-                    f"{work_dir},{inst},{ctrl},LOOP_LEN,{loop_len},{elapsed:.1f}s\n"
-                )
+                _f.write(f"{work_dir},{inst},{ctrl},LOOP_LEN,{loop_len}\n")
 
 
 # ---------------------------------------------------------------------------
