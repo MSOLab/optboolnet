@@ -2,10 +2,11 @@ import argparse
 import ast
 import datetime
 import json
+import multiprocessing as mp
+from multiprocessing.pool import ApplyResult
 import os
 import re
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from optboolnet.boolnet import Control
@@ -18,65 +19,109 @@ from pyomo.opt import TerminationCondition
 _ALGO_SUBDIRS = ["benders", "MibS"]
 
 # ---------------------------------------------------------------------------
-# Per-worker LLP model cache
+# Per-worker state
 # ---------------------------------------------------------------------------
 
-_worker_llp_models: Dict[Tuple[str, int], List[Tuple[int, AggregatedAttractorDetectionIP]]] = {}
+_worker_bns: Dict[str, object] = {}
+_worker_models: Dict[Tuple[str, int], AggregatedAttractorDetectionIP] = {}
 
 
-def _build_decomposed_llp_models(
+def _get_worker_bn(inst_name: str):
+    if inst_name not in _worker_bns:
+        _worker_bns[inst_name] = load_bn_in_repo(inst_name)
+    return _worker_bns[inst_name]
+
+
+def _solve_single_length_subproblem(
     inst_name: str,
-    max_length: int,
-) -> List[Tuple[int, AggregatedAttractorDetectionIP]]:
-    bn = load_bn_in_repo(inst_name)
-    models: List[Tuple[int, AggregatedAttractorDetectionIP]] = []
-    for length in range(1, max_length + 1):
-        model = AggregatedAttractorDetectionIP(
+    ctrl: Control,
+    length: int,
+) -> Tuple[int, bool]:
+    """Solve one fixed-length LLP and report whether it yields a violating attractor."""
+    key = (inst_name, length)
+    if key not in _worker_models:
+        bn = _get_worker_bn(inst_name)
+        model_llp = AggregatedAttractorDetectionIP(
             f"{inst_name}_{length}",
             bn,
             length,
             SolverConfig(),
         )
-        model.make_constr_stability_condition()
-        model.make_constr_periodicity()
-        model.make_constr_phenotype_and_length()
-        model.set_phenotype_obj()
-        model.fix_length(length)
-        models.append((length, model))
-    return models
+        model_llp.make_constr_stability_condition()
+        model_llp.make_constr_periodicity()
+        model_llp.make_constr_phenotype_and_length()
+        model_llp.set_phenotype_obj()
+        model_llp.fix_length(length)
+        _worker_models[key] = model_llp
+    model_llp = _worker_models[key]
+    model_llp.fix_control(ctrl)
+
+    if model_llp.optimize():
+        return length, model_llp.p.value < 0.5
+
+    term = getattr(model_llp, "last_termination_condition", None)
+    if term == TerminationCondition.infeasible:
+        return length, False
+    if term == TerminationCondition.maxTimeLimit:
+        return length, True
+    return length, True
 
 
-def _get_worker_llp_models(
+def _solve_length_shard(
     inst_name: str,
-    max_length: int,
-) -> List[Tuple[int, AggregatedAttractorDetectionIP]]:
-    key = (inst_name, max_length)
-    if key not in _worker_llp_models:
-        _worker_llp_models[key] = _build_decomposed_llp_models(inst_name, max_length)
-    return _worker_llp_models[key]
-
-
-def _find_min_viol_len_for_inst(inst_name: str, ctrl: Control, max_length: int) -> int:
-    """Return -1 if no violating attractor exists up to max_length, else min violating length."""
-    is_feasible = False
-    for length, model_llp in _get_worker_llp_models(inst_name, max_length):
-        model_llp.fix_control(ctrl)
-        if model_llp.optimize():
-            is_feasible = True
-            if model_llp.p.value < 0.5:
-                return length
-            continue
-
-        term = getattr(model_llp, "last_termination_condition", None)
-        if term == TerminationCondition.infeasible:
-            continue
-        if term == TerminationCondition.maxTimeLimit:
+    ctrl: Control,
+    shard_lengths: List[int],
+) -> int:
+    """Solve one worker shard and return min violating length in that shard, else -1."""
+    for length in shard_lengths:
+        _, is_violating = _solve_single_length_subproblem(inst_name, ctrl, length)
+        if is_violating:
             return length
-        return length
-
-    if is_feasible:
-        return -1
     return -1
+
+
+def _partition_lengths_mod(max_length: int, n_workers: int) -> List[List[int]]:
+    shards: List[List[int]] = [[] for _ in range(n_workers)]
+    for length in range(1, max_length + 1):
+        shards[(length - 1) % n_workers].append(length)
+    return shards
+
+
+def _find_min_viol_len_for_inst(
+    inst_name: str,
+    ctrl: Control,
+    length_shards: List[List[int]],
+    worker_pools: List[mp.Pool],
+) -> int:
+    """Find min violating length from statically assigned shards.
+
+    Reuses worker-local models for (instance, length) across controls, and assigns
+    lengths with round-robin mod worker_count.
+    """
+    if not length_shards:
+        return -1
+
+    n_workers = len(length_shards)
+    if n_workers == 1:
+        return _solve_length_shard(inst_name, ctrl, length_shards[0])
+
+    pending: List[ApplyResult] = []
+    for worker_idx, shard_lengths in enumerate(length_shards):
+        if not shard_lengths:
+            continue
+        pending.append(
+            worker_pools[worker_idx].apply_async(
+                _solve_length_shard,
+                (inst_name, ctrl, shard_lengths),
+            )
+        )
+
+    best_violation = -1
+    for async_result in pending:
+        local_min = _normalize_len(async_result.get())
+        if local_min > 0 and (best_violation == -1 or local_min < best_violation):
+            best_violation = local_min
+    return best_violation
 
 
 # ---------------------------------------------------------------------------
@@ -307,84 +352,67 @@ def verify_all(
     max_length: int,
     cache_path: str,
 ) -> None:
-    all_triplets: List[Tuple[str, str, Control]] = []
-    wdi_counts: Dict[Tuple[str, str], int] = {}
-
+    wdi_ctrls: Dict[Tuple[str, str], List[Control]] = {}
     for work_dir in work_dir_list:
         pairs = _collect_pairs(work_dir, instances, output_file)
         for inst, ctrl in pairs:
             wdi = (work_dir, inst)
-            wdi_counts[wdi] = wdi_counts.get(wdi, 0) + 1
-            all_triplets.append((work_dir, inst, ctrl))
+            wdi_ctrls.setdefault(wdi, []).append(ctrl)
 
-    total = len(all_triplets)
+    total = sum(len(ctrl_list) for ctrl_list in wdi_ctrls.values())
     if total == 0:
         return
 
-    to_run: List[Tuple[str, str, Control, tuple]] = []
-    for work_dir, inst, ctrl in all_triplets:
-        key = (inst, _ctrl_key(ctrl), max_length)
-        if key not in _result_cache:
-            to_run.append((work_dir, inst, ctrl, key))
-
-    n_cached = total - len(to_run)
-    n_wds = len({wd for wd, _, _ in all_triplets})
+    n_to_compute = 0
+    for (_, inst), ctrl_list in wdi_ctrls.items():
+        for ctrl in ctrl_list:
+            if (inst, _ctrl_key(ctrl), max_length) not in _result_cache:
+                n_to_compute += 1
+    n_cached = total - n_to_compute
+    n_wds = len({work_dir for work_dir, _ in wdi_ctrls})
     print(
-        f"Total: {total} bounded checks ({n_cached} cached, {len(to_run)} to compute) "
-        f"across {n_wds} experiment(s), {workers} workers [T={max_length}]"
+        f"Total: {total} bounded checks ({n_cached} cached, {n_to_compute} to compute) "
+        f"across {n_wds} experiment(s), {workers} subproblem workers [T={max_length}]"
     )
 
-    for work_dir, inst, ctrl in all_triplets:
-        key = (inst, _ctrl_key(ctrl), max_length)
-        if key in _result_cache:
-            _log_result(output_file, work_dir, inst, ctrl, _result_cache[key])
+    for (work_dir, inst), ctrl_list in wdi_ctrls.items():
+        total_for_inst = len(ctrl_list)
+        completed_for_inst = 0
+        last_pct = 0
+        n_workers_inst = max(1, min(workers, max_length))
+        length_shards = _partition_lengths_mod(max_length, n_workers_inst)
+        worker_pools = [mp.Pool(processes=1) for _ in range(n_workers_inst)]
+        try:
+            for ctrl in ctrl_list:
+                key = (inst, _ctrl_key(ctrl), max_length)
+                if key in _result_cache:
+                    min_viol_len = _result_cache[key]
+                else:
+                    min_viol_len = _find_min_viol_len_for_inst(
+                        inst,
+                        ctrl,
+                        length_shards,
+                        worker_pools,
+                    )
+                    _result_cache[key] = min_viol_len
+                    update_checker_json(cache_path, inst, ctrl, min_viol_len)
 
-    wdi_to_run_count: Dict[Tuple[str, str], int] = {}
-    for work_dir, inst, ctrl, key in to_run:
-        wdi = (work_dir, inst)
-        wdi_to_run_count[wdi] = wdi_to_run_count.get(wdi, 0) + 1
-    for wdi in wdi_counts:
-        if wdi not in wdi_to_run_count:
-            _log_instance_done(output_file, wdi[0], wdi[1])
+                _log_result(output_file, work_dir, inst, ctrl, min_viol_len)
 
-    if not to_run:
-        return
+                completed_for_inst += 1
+                pct = completed_for_inst * 100 // total_for_inst
+                milestone = pct // 10 * 10
+                if milestone > last_pct:
+                    tag = os.path.basename(work_dir)
+                    print(f"\t[{tag}/{inst}] {milestone}% ({completed_for_inst}/{total_for_inst})")
+                    last_pct = milestone
+        finally:
+            for pool in worker_pools:
+                pool.close()
+            for pool in worker_pools:
+                pool.join()
 
-    wdi_completed: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
-    last_pct_by_wdi: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_find_min_viol_len_for_inst, inst, ctrl, max_length): (
-                work_dir,
-                inst,
-                ctrl,
-                key,
-            )
-            for work_dir, inst, ctrl, key in to_run
-        }
-        for future in as_completed(futures):
-            work_dir, inst, ctrl, key = futures[future]
-            min_viol_len = _normalize_len(future.result())
-
-            _result_cache[key] = min_viol_len
-            update_checker_json(cache_path, inst, ctrl, min_viol_len)
-            _log_result(output_file, work_dir, inst, ctrl, min_viol_len)
-
-            wdi = (work_dir, inst)
-            wdi_completed[wdi] += 1
-            n = wdi_to_run_count[wdi]
-            c = wdi_completed[wdi]
-
-            pct = c * 100 // n
-            milestone = pct // 10 * 10
-            if milestone > last_pct_by_wdi[wdi]:
-                tag = os.path.basename(work_dir)
-                print(f"\t[{tag}/{inst}] {milestone}% ({c}/{n})")
-                last_pct_by_wdi[wdi] = milestone
-
-            if c == n:
-                _log_instance_done(output_file, work_dir, inst)
+        _log_instance_done(output_file, work_dir, inst)
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +468,12 @@ if __name__ == "__main__":
     ap.add_argument(
         "--workers",
         type=int,
-        default=os.cpu_count(),
+        default=os.cpu_count() or 1,
         metavar="N",
-        help=f"Number of parallel LLP checks (default: cpu_count={os.cpu_count()})",
+        help=(
+            "Number of parallel fixed-length LLP subproblems per control "
+            f"(default: cpu_count={os.cpu_count() or 1})"
+        ),
     )
     ap.add_argument(
         "--json-cache",
@@ -453,10 +484,20 @@ if __name__ == "__main__":
             "(default: _experiments/checker_bounded_T{T}.json)."
         ),
     )
+    ap.add_argument(
+        "--bootstrap-from-log",
+        action="store_true",
+        help=(
+            "If set, bootstrap cache entries from existing --output log "
+            "(default: off; only JSON cache is used)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.T < 1:
         raise ValueError("--T must be >= 1")
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
 
     output_path = (
         args.output
@@ -472,9 +513,10 @@ if __name__ == "__main__":
     n_loaded = load_checker_json(cache_path, args.T)
     if n_loaded:
         print(f"Loaded {n_loaded} cached bounded result(s) from {cache_path}")
-    n_from_log = extract_from_log(output_path, cache_path, args.T)
-    if n_from_log:
-        print(f"Bootstrap-added {n_from_log} bounded result(s) from existing log")
+    if args.bootstrap_from_log:
+        n_from_log = extract_from_log(output_path, cache_path, args.T)
+        if n_from_log:
+            print(f"Bootstrap-added {n_from_log} bounded result(s) from existing log")
 
     _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
