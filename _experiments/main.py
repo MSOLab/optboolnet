@@ -209,6 +209,23 @@ def main():
     alg_list = ", ".join(sorted(detected_algorithms))
     run_tag = datetime.now().strftime("%y%m%d_%H%M%S")
     run_log_path = os.path.join(root_dir, f"run_times__{run_tag}.log")
+    run_args_path = os.path.join(root_dir, f"run_args__{run_tag}.json")
+
+    run_args_payload = {
+        "timestamp": timestamp(),
+        "argv": sys.argv[1:],
+        "parsed_args": {
+            "root_dir": args.root_dir,
+            "resolved_root_dir": root_dir,
+            "subdirs": args.subdirs,
+            "instances": args.instances,
+            "workers": args.workers,
+            "time_limit": args.time_limit,
+        },
+        "subdir_time_limits_json": subdir_time_limits,
+    }
+    with open(run_args_path, "w", encoding="utf-8") as run_args_fp:
+        json.dump(run_args_payload, run_args_fp, indent=2)
 
     with open(run_log_path, "a", encoding="utf-8") as run_log_fp:
         def log_line(msg: str) -> None:
@@ -221,6 +238,7 @@ def main():
 
         log_line("[RUN START]")
         log_line(f"[RUN LOG] {run_log_path}")
+        log_line(f"[RUN ARGS] {run_args_path}")
         limit_msg = "per-subdir-json (strict)" if args.time_limit is None else f"{args.time_limit}s (runtime override)"
         log_line(
             f"Launching {len(tasks)} runs with algorithms={alg_list}, workers={args.workers}, "
