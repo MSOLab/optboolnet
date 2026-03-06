@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Optional
 import os
 import numpy as np
 from optboolnet.log import EnumBendersStep, EnumCutType, BendersLogger
@@ -75,184 +75,255 @@ class BendersAnalysis:
         self.option_names = option_names
         self.options = options
         self.inst = inst
-        self.build_log = self.rename_exp(pd.read_csv(build_log_fname))
-        self.solve_log = self.rename_exp(pd.read_csv(solve_log_fname))
-        if "model" in self.solve_log.columns:
-            model_clean = self.solve_log["model"].astype(str).str.replace("'", "", regex=False)
-            self.solve_log["model"] = model_clean
-            self.solve_log["model_num"] = pd.to_numeric(model_clean, errors="coerce")
-        self.cut_log = self.rename_exp(pd.read_csv(cut_log_fname))
+        self._key_list = self.option_names + ["inst"]
+        self.build_log = self.rename_exp(self._read_log_csv(build_log_fname, _build_log_columns))
+        self.solve_log = self.rename_exp(self._read_log_csv(solve_log_fname, _solve_log_columns))
+        self.cut_log = self.rename_exp(self._read_log_csv(cut_log_fname, _cut_log_columns))
+
+        self._prepare_log_types()
+        self._prepare_metric_tables()
 
     @property
     def key_list(self):
-        return self.option_names + ["inst"]
+        return self._key_list
 
     @property
     def key_len(self):
         return len(self.key_list)
 
+    @staticmethod
+    def _read_log_csv(path: str, default_columns: list[str]) -> pd.DataFrame:
+        try:
+            return pd.read_csv(path)
+        except FileNotFoundError:
+            return pd.DataFrame(columns=default_columns[1:])
+
     def rename_exp(self, df: pd.DataFrame):
-        df.drop(columns=["experiment"], inplace=True)
+        if "experiment" in df.columns:
+            df = df.drop(columns=["experiment"])
+        else:
+            df = df.copy()
         df["inst"] = self.inst
         for opt_name, opt in zip(self.option_names, self.options):
             df[opt_name] = opt
         return df
 
-    @property
-    def solution_count(self):
-        _df = (
+    def _prepare_log_types(self):
+        for df in (self.build_log, self.solve_log, self.cut_log):
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            if "level" in df.columns:
+                df["level"] = pd.to_numeric(df["level"], errors="coerce")
+
+        if "step" in self.solve_log.columns:
+            self.solve_log["step"] = self.solve_log["step"].astype("category")
+        if "solve_time" in self.solve_log.columns:
+            self.solve_log["solve_time"] = pd.to_numeric(self.solve_log["solve_time"], errors="coerce")
+        if "feasible" in self.solve_log.columns:
+            self.solve_log["feasible"] = self.solve_log["feasible"].astype(str).str.strip().str.lower().map(
+                {"true": True, "false": False}
+            )
+
+        if "model" in self.solve_log.columns:
+            model_clean = self.solve_log["model"].astype(str).str.replace("'", "", regex=False)
+            self.solve_log["model"] = model_clean
+            self.solve_log["model_num"] = pd.to_numeric(model_clean, errors="coerce")
+
+        if "cut_type" in self.cut_log.columns:
+            self.cut_log["cut_type"] = self.cut_log["cut_type"].astype("category")
+        if "cut_strength" in self.cut_log.columns:
+            self.cut_log["cut_strength"] = pd.to_numeric(self.cut_log["cut_strength"], errors="coerce")
+
+    def _prepare_metric_tables(self):
+        key_list = self.key_list
+        key_level = key_list + ["level"]
+        metrics: dict[str, pd.DataFrame] = {}
+
+        # solution_count
+        solution_count = (
             self.cut_log.loc[
-                self.cut_log["cut_type"] == EnumCutType.MINIMALITY.name,
-                self.key_list + ["level", "cut_strength"],
+                self.cut_log.get("cut_type", pd.Series(index=self.cut_log.index, dtype=object))
+                == EnumCutType.MINIMALITY.name,
+                key_level + ["cut_strength"],
             ]
-            .groupby(self.key_list + ["level"])
+            .groupby(key_level, observed=True)["cut_strength"]
             .count()
-            .rename(columns={"cut_strength": "sol"})
+            .rename("sol")
             .reset_index()
         )
-        if len(_df) == 0:
-            return pd.DataFrame(
-                [[*self.options, self.inst, 0, 0]], columns=self.key_list + ["level", "sol"]
+        if solution_count.empty:
+            solution_count = pd.DataFrame(
+                [[*self.options, self.inst, 0, 0]],
+                columns=key_level + ["sol"],
+            )
+        metrics["solution_count"] = solution_count
+
+        # build_time
+        metrics["build_time"] = (
+            self.build_log[key_list + ["timestamp"]]
+            .groupby(key_list, observed=True)["timestamp"]
+            .max()
+            .rename("build_time")
+            .reset_index()
+        )
+
+        # completion_time
+        if self.solve_log.empty:
+            metrics["completion_time"] = pd.DataFrame(
+                [[*self.options, self.inst, 0, np.nan, False]],
+                columns=key_level + ["completion_time", "level_finished"],
             )
         else:
-            return _df
+            completion_time = (
+                self.solve_log[key_level + ["timestamp"]]
+                .groupby(key_level, observed=True)["timestamp"]
+                .max()
+                .rename("completion_time")
+                .reset_index()
+            )
+            finished_levels = set(
+                self.solve_log.loc[
+                    self.solve_log["step"] == EnumBendersStep.FINISHED.name, "level"
+                ].dropna()
+            )
+            completion_time["level_finished"] = completion_time["level"].isin(finished_levels)
+            metrics["completion_time"] = completion_time
+
+        # computation_time
+        metrics["computation_time"] = (
+            self.solve_log.loc[
+                self.solve_log["step"] != EnumBendersStep.FINISHED.name,
+                key_list + ["step", "solve_time"],
+            ]
+            .groupby(key_list + ["step"], observed=True)["solve_time"]
+            .sum()
+            .reset_index()
+        )
+
+        # count_cuts
+        metrics["count_cuts"] = (
+            self.cut_log.loc[
+                self.cut_log["cut_type"] != EnumCutType.MINIMALITY.name,
+                key_level + ["cut_type"],
+            ]
+            .groupby(key_level + ["cut_type"], observed=True)
+            .size()
+            .rename("count_cuts")
+            .reset_index()
+        )
+
+        # avg_cuts
+        metrics["avg_cuts"] = (
+            self.cut_log.loc[
+                self.cut_log["cut_type"] != EnumCutType.MINIMALITY.name,
+                key_list + ["cut_type", "cut_strength"],
+            ]
+            .groupby(key_list + ["cut_type"], observed=True)["cut_strength"]
+            .mean()
+            .rename("num_literals")
+            .reset_index()
+        )
+
+        # count_attractor_size
+        if "model_num" not in self.solve_log.columns:
+            metrics["count_attractor_size"] = pd.DataFrame(columns=key_list + ["model", "attractors"])
+        else:
+            count_df = (
+                self.solve_log.loc[
+                    (self.solve_log["step"] == EnumBendersStep.LOWER_LEVEL_PROBLEM.name)
+                    & (self.solve_log["model_num"].notna()),
+                    key_list + ["model_num", "timestamp"],
+                ]
+                .groupby(key_list + ["model_num"], observed=True)["timestamp"]
+                .count()
+                .rename("attractors")
+                .reset_index()
+            )
+            if count_df.empty:
+                metrics["count_attractor_size"] = pd.DataFrame(columns=key_list + ["model", "attractors"])
+            else:
+                sol_sum = (
+                    metrics["solution_count"]
+                    .groupby(key_list, observed=True)["sol"]
+                    .sum()
+                    .reset_index()
+                )
+                merged_df = count_df.merge(sol_sum, on=key_list, how="left")
+                merged_df["sol"] = merged_df["sol"].fillna(0)
+                merged_df["attractors"] = merged_df["attractors"] - merged_df["sol"]
+                merged_df["attractors"] = (
+                    merged_df["attractors"] - merged_df["attractors"].shift(-1).fillna(0)
+                ).astype(int)
+                merged_df = merged_df[merged_df["attractors"] > 0].copy()
+                merged_df = merged_df.rename(columns={"model_num": "model"})
+                merged_df["model"] = merged_df["model"].astype(int)
+                metrics["count_attractor_size"] = merged_df[key_list + ["model", "attractors"]]
+
+        # separation_success
+        metrics["separation_success"] = (
+            self.solve_log.loc[
+                self.solve_log["step"] == EnumBendersStep.SEPARATION_PROBLEM.name,
+                key_list + ["step", "feasible"],
+            ]
+            .groupby(key_list + ["step", "feasible"], observed=True)
+            .size()
+            .rename("success")
+            .reset_index()
+        )
+
+        # max_level
+        metrics["max_level"] = (
+            self.solve_log.loc[
+                self.solve_log["step"] == EnumBendersStep.FINISHED.name,
+                key_list + ["level"],
+            ]
+            .groupby(key_list, observed=True)["level"]
+            .max()
+            .rename("max_level")
+            .reset_index()
+        )
+
+        self._metric_tables = metrics
+
+    def get_metric_tables(self, metric_names: Optional[list[str]] = None) -> dict[str, pd.DataFrame]:
+        names = metric_names or list(self._metric_tables.keys())
+        return {name: self._metric_tables[name] for name in names}
+
+    @property
+    def solution_count(self):
+        return self._metric_tables["solution_count"]
 
     @property
     def build_time(self):
-        return (
-            self.build_log[self.key_list + ["timestamp"]]
-            .groupby(self.key_list)
-            .max()
-            .rename(columns={"timestamp": "build_time"})
-            .reset_index()
-        )
+        return self._metric_tables["build_time"]
 
     @property
     def completion_time(self):
-        if len(self.solve_log) == 0:
-            return pd.DataFrame(
-                [[*self.options, self.inst, 0, np.nan, False]],
-                columns=self.key_list + ["level", "completion_time", "level_finished"],
-            )
-        time_df = (
-            self.solve_log[self.key_list + ["level", "timestamp"]]
-            .groupby(self.key_list + ["level"])
-            .max()
-            .rename(columns={"timestamp": "completion_time"})
-            .reset_index()
-        )
-        finished_levels = self.solve_log.loc[
-            self.solve_log["step"] == EnumBendersStep.FINISHED.name, "level"
-        ].unique()
-        time_df["level_finished"] = time_df["level"].isin(finished_levels)
-        return time_df
+        return self._metric_tables["completion_time"]
 
     @property
     def computation_time(self):
-        return (
-            self.solve_log.loc[
-                self.solve_log["step"] != EnumBendersStep.FINISHED.name,
-                self.key_list + ["step", "solve_time"],
-            ]
-            .groupby(self.key_list + ["step"])
-            .sum()
-            .rename(columns={"timestamp": "completion_time"})
-            .reset_index()
-        )
+        return self._metric_tables["computation_time"]
 
     @property
     def count_cuts(self):
-        return (
-            self.cut_log.loc[
-                self.cut_log["cut_type"] != EnumCutType.MINIMALITY.name,
-                self.key_list + ["level", "cut_type", "timestamp"],
-            ]
-            .groupby(self.key_list + ["level", "cut_type"])
-            .count()
-            .rename(columns={"timestamp": "count_cuts"})
-            .reset_index()
-        )
+        return self._metric_tables["count_cuts"]
 
     @property
     def avg_cuts(self):
-        return (
-            self.cut_log.loc[
-                self.cut_log["cut_type"] != EnumCutType.MINIMALITY.name,
-                self.key_list + ["level", "cut_type", "cut_strength"],
-            ]
-            .groupby(self.key_list + ["cut_type"])
-            # .agg(["mean", "count"])
-            .mean()
-            .rename(columns={"cut_strength": "num_literals"})
-            .reset_index()
-            .drop("level", axis=1)
-        )
+        return self._metric_tables["avg_cuts"]
 
     @property
     def count_attractor_size(self):
-        if "model_num" not in self.solve_log.columns:
-            return pd.DataFrame(
-                columns=self.key_list + ["model", "attractors"]
-            )
-
-        count_df = (
-            self.solve_log.loc[
-                (self.solve_log["step"] == EnumBendersStep.LOWER_LEVEL_PROBLEM.name)
-                & (self.solve_log["model_num"].notna()),
-                self.key_list + ["model_num", "timestamp"],
-            ]
-            .groupby(self.key_list + ["model_num"])
-            .count()
-            .rename(columns={"timestamp": "attractors"})
-        )
-        if len(count_df) == 0:
-            return pd.DataFrame(columns=self.key_list + ["model", "attractors"])
-        merged_df = (
-            count_df.reset_index()
-            .set_index(self.key_list)
-            .merge(
-                self.solution_count.groupby(self.key_list)
-                .sum()
-                .reset_index()
-                .set_index(self.key_list),
-                left_index=True,
-                right_index=True,
-                how="left"
-            ).copy()
-        )
-        merged_df["attractors"] = merged_df["attractors"] - merged_df["sol"]
-        merged_df["attractors"] = (merged_df["attractors"]  - merged_df["attractors"].shift(-1).fillna(0)).astype(int)
-        merged_df = merged_df[merged_df["attractors"] > 0]
-        merged_df.drop(["sol","level"], axis=1, inplace=True)
-        merged_df = merged_df.rename(columns={"model_num": "model"})
-        merged_df["model"] = merged_df["model"].astype(int)
-        return merged_df[merged_df["attractors"] > 0]
+        return self._metric_tables["count_attractor_size"]
 
     @property
     def separation_success(self):
-        return (
-            self.solve_log.loc[
-                self.solve_log["step"] == EnumBendersStep.SEPARATION_PROBLEM.name,
-                self.key_list + ["step", "feasible", "solve_time"],
-            ]
-            .groupby(self.key_list + ["step", "feasible"])
-            .count()
-            .reset_index()
-            .rename(columns={"solve_time": "success"})
-        )
+        return self._metric_tables["separation_success"]
 
     @property
     def max_level(self):
-        return (
-            self.solve_log.loc[
-                self.solve_log["step"] == EnumBendersStep.FINISHED.name,
-                self.key_list + ["level"],
-            ]
-            .groupby(self.key_list)
-            .max()
-            .rename(columns={"level": "max_level"})
-            .reset_index()
-        )
+        return self._metric_tables["max_level"]
 
 
 class Experiment:
@@ -293,9 +364,26 @@ class Experiment:
         max_level
         """
 
+        if not self.log_list:
+            return pd.DataFrame()
         return pd.concat(
-            (getattr(log_analysis, attr_name) for log_analysis in self.log_list), axis=0
+            (getattr(log_analysis, attr_name) for log_analysis in self.log_list),
+            axis=0,
+            ignore_index=True,
         )
+
+    def get_agg_tables(self, attr_names: List[str]) -> dict[str, pd.DataFrame]:
+        if not self.log_list:
+            return {name: pd.DataFrame() for name in attr_names}
+        frames_by_metric = {name: [] for name in attr_names}
+        for log_analysis in self.log_list:
+            metric_tables = log_analysis.get_metric_tables(attr_names)
+            for name in attr_names:
+                frames_by_metric[name].append(metric_tables[name])
+        return {
+            name: pd.concat(frames_by_metric[name], axis=0, ignore_index=True)
+            for name in attr_names
+        }
 
 
 _METRICS = [

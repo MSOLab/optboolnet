@@ -2,16 +2,16 @@
 collect_results.py
 ------------------
 Scan a folder for experiment subdirectories, detect the algorithm subfolder
-automatically, and export every metric from analysis.py to its own CSV.
+automatically, and export summary tables.
 
 Usage
 -----
   python collect_results.py <folder> [options]
 
-  # All metrics for all experiments in 260302_full
+  # Build summaries for all metrics in 260302_full
   python collect_results.py _experiments/260302_full
 
-  # Only two metrics, custom output dir
+  # Build summaries from only two metrics, custom output dir
   python collect_results.py _experiments/260302_full \\
       --metrics completion_time solution_count \\
       --output results/260302
@@ -132,29 +132,35 @@ def build_experiment_contexts(experiments: list[tuple[str, str, str]]) -> list[E
 # Metric collection
 # ---------------------------------------------------------------------------
 
-def collect_metric(
+def collect_metrics(
     contexts: list[ExperimentContext],
-    metric: str,
-) -> pd.DataFrame | None:
+    metrics: list[str],
+) -> dict[str, pd.DataFrame]:
     """
-    Compute *metric* for every experiment and return a concatenated DataFrame
-    with 'experiment' and 'max_length' label columns, or None if all failed.
+    Compute all requested metrics in one pass per experiment context.
     """
-    frames = []
+    frames_by_metric: dict[str, list[pd.DataFrame]] = {metric: [] for metric in metrics}
     for ctx in contexts:
         try:
-            df = ctx.exp.get_agg_table(metric)
+            metric_tables = ctx.exp.get_agg_tables(metrics)
+        except Exception as exc:
+            print(f"  [skip] {ctx.exp_name}/{ctx.alg}: {exc}", file=sys.stderr)
+            continue
+
+        for metric in metrics:
+            df = metric_tables.get(metric)
+            if df is None or df.empty:
+                continue
+            df = df.copy()
             df["max_length"] = ctx.config.get("max_length", None)
             df["max_control_size"] = ctx.config.get("max_control_size", None)
-            frames.append(df)
-        except Exception as exc:
-            print(
-                f"  [skip] {ctx.exp_name}/{ctx.alg}/{metric}: {exc}",
-                file=sys.stderr,
-            )
-    if not frames:
-        return None
-    return pd.concat(frames, axis=0, ignore_index=True)
+            frames_by_metric[metric].append(df)
+
+    return {
+        metric: pd.concat(frames, axis=0, ignore_index=True)
+        for metric, frames in frames_by_metric.items()
+        if frames
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +172,13 @@ def _str_inst(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["inst"] = df["inst"].astype(str)
     return df
+
+
+def _to_indexed(df: pd.DataFrame, key_cols: list[str], value_cols: list[str]) -> pd.DataFrame:
+    cols = key_cols + [c for c in value_cols if c in df.columns]
+    out = df[cols].drop_duplicates(subset=key_cols).set_index(key_cols)
+    out.index = out.index.set_names(key_cols)
+    return out
 
 
 def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
@@ -189,25 +202,20 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
     _LEVEL_KEY = ["experiment", "inst", "level"]
     _INST_KEY  = ["experiment", "inst"]
 
-    result: pd.DataFrame | None = None
-
-    def _merge(left, right, key):
-        if left is None:
-            return right.copy()
-        return left.merge(right, on=key, how="outer")
+    level_parts: list[pd.DataFrame] = []
+    inst_parts: list[pd.DataFrame] = []
 
     # -- Level-aware metrics (join key includes level) -----------------------
 
     # completion_time: (experiment, inst, level, completion_time, level_finished)
     if "completion_time" in metric_dfs:
         df = _str_inst(metric_dfs["completion_time"])
-        cols = _LEVEL_KEY + [c for c in ["completion_time", "level_finished"] if c in df.columns]
-        result = _merge(result, df[cols], _LEVEL_KEY)
+        level_parts.append(_to_indexed(df, _LEVEL_KEY, ["completion_time", "level_finished"]))
 
     # solution_count: (experiment, inst, level, sol)
     if "solution_count" in metric_dfs:
-        df = _str_inst(metric_dfs["solution_count"])[_LEVEL_KEY + ["sol"]]
-        result = _merge(result, df, _LEVEL_KEY)
+        df = _str_inst(metric_dfs["solution_count"])
+        level_parts.append(_to_indexed(df, _LEVEL_KEY, ["sol"]))
 
     # count_cuts: (experiment, inst, level, cut_type, count_cuts)
     # → pivot by cut_type → count_cuts_<TYPE>
@@ -217,27 +225,21 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
             df = (
                 df.pivot_table(index=_LEVEL_KEY, columns="cut_type", values="count_cuts")
                 .rename(columns=lambda c: f"count_cuts_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df, _LEVEL_KEY)
+            level_parts.append(df)
 
     # -- Per-inst metrics (broadcast across levels) --------------------------
 
     # build_time: (experiment, inst, build_time, max_length, max_control_size)
     if "build_time" in metric_dfs:
         df = _str_inst(metric_dfs["build_time"])
-        cols = [
-            c
-            for c in [*_INST_KEY, "max_length", "max_control_size", "build_time"]
-            if c in df.columns
-        ]
-        result = _merge(result, df[cols], _INST_KEY)
+        inst_parts.append(_to_indexed(df, _INST_KEY, ["max_length", "max_control_size", "build_time"]))
 
     # max_level: (experiment, inst, max_level)
     if "max_level" in metric_dfs:
-        df = _str_inst(metric_dfs["max_level"])[_INST_KEY + ["max_level"]]
-        result = _merge(result, df, _INST_KEY)
+        df = _str_inst(metric_dfs["max_level"])
+        inst_parts.append(_to_indexed(df, _INST_KEY, ["max_level"]))
 
     # avg_cuts: pivot by cut_type → avg_cuts_<TYPE>
     if "avg_cuts" in metric_dfs:
@@ -246,10 +248,9 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
             df = (
                 df.pivot_table(index=_INST_KEY, columns="cut_type", values="num_literals")
                 .rename(columns=lambda c: f"avg_cuts_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df, _INST_KEY)
+            inst_parts.append(df)
 
     # computation_time: pivot by step → time_<STEP>
     if "computation_time" in metric_dfs:
@@ -260,27 +261,37 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
                     index=_INST_KEY, columns="step", values="solve_time", aggfunc="sum"
                 )
                 .rename(columns=lambda c: f"time_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df, _INST_KEY)
-
-    if result is None:
+            inst_parts.append(df)
+    if not level_parts and not inst_parts:
         return None
+
+    result_idx: pd.DataFrame | None = None
+    if level_parts:
+        result_idx = pd.concat(level_parts, axis=1, join="outer")
+    if inst_parts:
+        inst_idx = pd.concat(inst_parts, axis=1, join="outer")
+        if result_idx is None:
+            result_idx = inst_idx
+        else:
+            result_idx = result_idx.join(inst_idx, on=_INST_KEY, how="left")
+
+    result = result_idx.reset_index()
 
     # Backfill max_length / max_control_size from any metric that carries them
     # (in case build_time was not collected).
     if "max_length" not in result.columns:
         for df in metric_dfs.values():
             if "max_length" in df.columns:
-                ml = _str_inst(df)[_INST_KEY + ["max_length"]].drop_duplicates()
-                result = result.merge(ml, on=_INST_KEY, how="left")
+                ml = _to_indexed(_str_inst(df), _INST_KEY, ["max_length"])
+                result = result.join(ml, on=_INST_KEY, how="left")
                 break
     if "max_control_size" not in result.columns:
         for df in metric_dfs.values():
             if "max_control_size" in df.columns:
-                mcs = _str_inst(df)[_INST_KEY + ["max_control_size"]].drop_duplicates()
-                result = result.merge(mcs, on=_INST_KEY, how="left")
+                mcs = _to_indexed(_str_inst(df), _INST_KEY, ["max_control_size"])
+                result = result.join(mcs, on=_INST_KEY, how="left")
                 break
 
     return result
@@ -304,27 +315,17 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
         return None
 
     _INST_KEY = ["experiment", "inst"]
-    result: pd.DataFrame | None = None
-
-    def _merge(left, right):
-        if left is None:
-            return right.copy()
-        return left.merge(right, on=_INST_KEY, how="outer")
+    inst_parts: list[pd.DataFrame] = []
 
     # build_time: (experiment, inst, build_time, max_length, max_control_size)
     if "build_time" in metric_dfs:
         df = _str_inst(metric_dfs["build_time"])
-        cols = [
-            c
-            for c in [*_INST_KEY, "max_length", "max_control_size", "build_time"]
-            if c in df.columns
-        ]
-        result = _merge(result, df[cols])
+        inst_parts.append(_to_indexed(df, _INST_KEY, ["max_length", "max_control_size", "build_time"]))
 
     # max_level: (experiment, inst, max_level)
     if "max_level" in metric_dfs:
-        df = _str_inst(metric_dfs["max_level"])[_INST_KEY + ["max_level"]]
-        result = _merge(result, df)
+        df = _str_inst(metric_dfs["max_level"])
+        inst_parts.append(_to_indexed(df, _INST_KEY, ["max_level"]))
 
     # completion_time: value at the highest *finished* level per inst
     if "completion_time" in metric_dfs:
@@ -336,7 +337,7 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
                 df.loc[df.groupby(_INST_KEY)["level"].idxmax()]
                 [_INST_KEY + ["completion_time"]]
             )
-            result = _merge(result, df)
+            inst_parts.append(_to_indexed(df, _INST_KEY, ["completion_time"]))
 
     # solution_count: sum sol across all levels
     if "solution_count" in metric_dfs:
@@ -346,7 +347,7 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
             .sum()
             .rename(columns={"sol": "total_solutions"})
         )
-        result = _merge(result, df)
+        inst_parts.append(_to_indexed(df, _INST_KEY, ["total_solutions"]))
 
     # avg_cuts: pivot by cut_type → avg_cuts_<TYPE>
     if "avg_cuts" in metric_dfs:
@@ -355,10 +356,9 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
             df = (
                 df.pivot_table(index=_INST_KEY, columns="cut_type", values="num_literals")
                 .rename(columns=lambda c: f"avg_cuts_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df)
+            inst_parts.append(df)
 
     # count_cuts: sum over levels, then pivot by cut_type → count_cuts_<TYPE>
     if "count_cuts" in metric_dfs:
@@ -369,10 +369,9 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
                 .sum()
                 .pivot_table(index=_INST_KEY, columns="cut_type", values="count_cuts")
                 .rename(columns=lambda c: f"count_cuts_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df)
+            inst_parts.append(df)
 
     # computation_time: pivot by step → time_<STEP>
     if "computation_time" in metric_dfs:
@@ -383,25 +382,25 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
                     index=_INST_KEY, columns="step", values="solve_time", aggfunc="sum"
                 )
                 .rename(columns=lambda c: f"time_{c}")
-                .reset_index()
             )
             df.columns.name = None
-            result = _merge(result, df)
-
-    if result is None:
+            inst_parts.append(df)
+    if not inst_parts:
         return None
+
+    result = pd.concat(inst_parts, axis=1, join="outer").reset_index()
 
     if "max_length" not in result.columns:
         for df in metric_dfs.values():
             if "max_length" in df.columns:
-                ml = _str_inst(df)[_INST_KEY + ["max_length"]].drop_duplicates()
-                result = result.merge(ml, on=_INST_KEY, how="left")
+                ml = _to_indexed(_str_inst(df), _INST_KEY, ["max_length"])
+                result = result.join(ml, on=_INST_KEY, how="left")
                 break
     if "max_control_size" not in result.columns:
         for df in metric_dfs.values():
             if "max_control_size" in df.columns:
-                mcs = _str_inst(df)[_INST_KEY + ["max_control_size"]].drop_duplicates()
-                result = result.merge(mcs, on=_INST_KEY, how="left")
+                mcs = _to_indexed(_str_inst(df), _INST_KEY, ["max_control_size"])
+                result = result.join(mcs, on=_INST_KEY, how="left")
                 break
 
     return result
@@ -414,8 +413,8 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Scan a folder for experiment subdirectories and export all "
-            "metrics from analysis.py to CSV files in an output directory."
+            "Scan a folder for experiment subdirectories and export summary "
+            "CSV tables to an output directory."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -437,7 +436,7 @@ def main() -> None:
         choices=_METRICS,
         metavar="METRIC",
         help=(
-            "Metrics to compute. Choices: "
+            "Metrics to compute and use when building summaries. Choices: "
             + ", ".join(_METRICS)
             + ". Default: all."
         ),
@@ -484,24 +483,12 @@ def main() -> None:
     output_dir = args.output or os.path.join(args.folder, "_results")
     os.makedirs(output_dir, exist_ok=True)
     print(f"\nOutput directory: {output_dir}")
-    print(f"Computing {len(args.metrics)} metric(s):\n")
-
-    written = []
-    metric_dfs: dict[str, pd.DataFrame] = {}
-
-    for metric in args.metrics:
-        print(f"  {metric:<30}", end="", flush=True)
-        df = collect_metric(contexts, metric)
-        if df is not None and not df.empty:
-            metric_dfs[metric] = df
-            out_path = os.path.join(output_dir, f"{metric}.csv")
-            df.to_csv(out_path, index=False)
-            print(f"{len(df):>6} rows  →  {out_path}")
-            written.append(out_path)
-        else:
-            print("  (no data)")
+    print(f"Computing {len(args.metrics)} metric(s) for summary generation...")
+    metric_dfs = collect_metrics(contexts, args.metrics)
+    print(f"Computed metric tables: {', '.join(sorted(metric_dfs.keys())) or '(none)'}")
 
     # --- Build and write summary tables -------------------------------------
+    written = []
     for label, builder, fname in [
         ("summary (per level)",    build_summary_table,   "summary.csv"),
         ("summary (per inst)",     build_per_inst_table,  "summary_per_inst.csv"),
