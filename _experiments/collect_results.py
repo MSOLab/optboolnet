@@ -2,19 +2,22 @@
 collect_results.py
 ------------------
 Scan a folder for experiment subdirectories, detect the algorithm subfolder
-automatically, and export summary tables.
+automatically, and export summary + aggregate tables.
 
 Usage
 -----
   python collect_results.py <folder> [options]
 
-  # Build summaries for all metrics in 260302_full
+  # Build summaries + aggregate tables for all metrics in 260302_full
   python collect_results.py _experiments/260302_full
 
   # Build summaries from only two metrics, custom output dir
   python collect_results.py _experiments/260302_full \\
       --metrics completion_time solution_count \\
       --output results/260302
+
+  # Build aggregate tables only from existing summary CSVs
+  python collect_results.py _experiments/260302_full/_results --from-summary
 
   # Just list what was detected, don't compute anything
   python collect_results.py _experiments/260302_full --list
@@ -32,6 +35,16 @@ import pandas as pd
 # analysis.py lives in the same directory as this script
 sys.path.insert(0, str(Path(__file__).parent))
 from analysis import Experiment, _METRICS, inst_list
+
+INST_ORDER = ["S1", "S2", "S3", "S4", "M1", "M2", "M3", "L1", "L2", "L3", "L4"]
+LABEL_MAP: dict[str, str] = {}
+_CUT_LABEL_MAP: dict[str, str] = {
+    "ATTRACTOR_CUT": "AT cut",
+    "TRAP_SPACE_CUT": "TS cut",
+    "MINIMALITY": "MIN cut",
+    "NO_GOOD_MASTER": "No-good(master)",
+    "NO_GOOD_LOWER_LEVEL": "No-good(lower)",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -407,21 +420,219 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
 
 
 # ---------------------------------------------------------------------------
+# Aggregate tables
+# ---------------------------------------------------------------------------
+
+def make_solution_count(df: pd.DataFrame) -> pd.DataFrame:
+    inst_present = [c for c in INST_ORDER if c in df["inst"].values]
+    tbl = (
+        df.pivot_table(
+            index=["max_length", "experiment"],
+            columns="inst",
+            values="total_solutions",
+            aggfunc="first",
+        )
+        .reindex(columns=inst_present)
+        .sort_index()
+    )
+    tbl.columns.name = None
+    return tbl
+
+
+def make_solution_count_bold(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame:
+    base = make_solution_count(df)
+    if "level_finished" not in ct.columns:
+        return base
+
+    keys = ["experiment", "inst"]
+    finished = ct[ct["level_finished"] == True].copy()
+    if finished.empty:
+        finished_pairs = set()
+    else:
+        finished_max = (
+            finished.groupby(keys, as_index=False)["level"].max()
+            .rename(columns={"level": "finished_level"})
+        )
+        finished_max["finished_level"] = pd.to_numeric(
+            finished_max["finished_level"], errors="coerce"
+        )
+
+        if "max_control_size" in df.columns:
+            req = (
+                df[keys + ["max_control_size"]]
+                .drop_duplicates()
+                .rename(columns={"max_control_size": "required_level"})
+            )
+            req["required_level"] = pd.to_numeric(req["required_level"], errors="coerce")
+        else:
+            req = (
+                ct.groupby("experiment", as_index=False)["level"].max()
+                .rename(columns={"level": "required_level"})
+            )
+            req = finished_max[["experiment", "inst"]].merge(req, on="experiment", how="left")
+
+        chk = finished_max.merge(req, on=keys, how="left")
+        chk = chk[chk["required_level"].notna()]
+        finished_pairs = set(
+            zip(
+                chk.loc[chk["finished_level"] >= chk["required_level"], "experiment"],
+                chk.loc[chk["finished_level"] >= chk["required_level"], "inst"],
+            )
+        )
+
+    out = base.copy().astype(object)
+    for (_, experiment), row in base.iterrows():
+        for inst in base.columns:
+            val = row[inst]
+            if pd.isna(val):
+                out.loc[(_, experiment), inst] = ""
+            else:
+                cell = str(int(round(val)))
+                if (experiment, inst) in finished_pairs:
+                    cell = f"{cell}*"
+                out.loc[(_, experiment), inst] = cell
+    return out
+
+
+def make_completion_time(ct: pd.DataFrame, variant: str | None) -> pd.DataFrame:
+    ct = ct.copy().dropna(subset=["experiment", "inst", "level"])
+    if variant:
+        ct = ct[ct["experiment"].str.endswith(variant)]
+    ct["label"] = ct["experiment"].map(lambda e: LABEL_MAP.get(e, e))
+    if "level_finished" in ct.columns:
+        ct["completion_time"] = ct["completion_time"].where(ct["level_finished"])
+
+    inst_present = [i for i in INST_ORDER if i in ct["inst"].values]
+    labels_ordered = sorted(ct["label"].unique())
+    ml_values = sorted(ct["max_length"].unique())
+    tbl = ct.pivot_table(
+        index="level",
+        columns=["max_length", "inst", "label"],
+        values="completion_time",
+    )
+    ordered_cols = [
+        (ml, inst, label)
+        for ml in ml_values
+        for inst in inst_present
+        for label in labels_ordered
+        if (ml, inst, label) in tbl.columns
+    ]
+    tbl = tbl.reindex(columns=ordered_cols).round(1)
+    tbl.columns.names = ["T_max", "", ""]
+    tbl.index.name = "lambda"
+    return tbl
+
+
+def _cut_columns(spi: pd.DataFrame, col_prefix: str) -> list[str]:
+    return sorted(c for c in spi.columns if c.startswith(f"{col_prefix}_"))
+
+
+def _cut_display_label(col_name: str, col_prefix: str) -> str:
+    raw = col_name[len(col_prefix) + 1 :]
+    return _CUT_LABEL_MAP.get(raw, raw)
+
+
+def _cuts_for_ml(
+    spi_ml: pd.DataFrame, cut_cols: list[str], section: str, col_prefix: str
+) -> pd.DataFrame | None:
+    inst_present = [i for i in INST_ORDER if i in spi_ml["inst"].values]
+    rows = []
+    for alg in sorted(spi_ml["alg"].dropna().unique()):
+        spi_alg = spi_ml[spi_ml["alg"] == alg]
+        for col in cut_cols:
+            if col not in spi_alg.columns:
+                continue
+            sub = spi_alg.groupby("inst")[col].mean().reindex(inst_present)
+            if sub.notna().sum() == 0:
+                continue
+            sub.name = (section, alg, _cut_display_label(col, col_prefix))
+            rows.append(sub)
+    if not rows:
+        return None
+    tbl = pd.concat(rows, axis=1).T
+    tbl.index = pd.MultiIndex.from_tuples(tbl.index, names=["Section", "Algorithm", "Cuts"])
+    return tbl
+
+
+def make_cuts_table(spi: pd.DataFrame, variant: str | None, col_prefix: str) -> pd.DataFrame:
+    spi = spi.copy()
+    if variant:
+        spi = spi[spi["experiment"].str.endswith(variant)]
+    spi["alg"] = spi["experiment"].str.split("_").str[0]
+
+    cut_cols = _cut_columns(spi, col_prefix)
+    if not cut_cols:
+        return pd.DataFrame()
+    section = "Total # of cuts" if col_prefix == "count_cuts" else "Avg. literals in a cut"
+    parts: dict[int, pd.DataFrame] = {}
+    for ml in sorted(spi["max_length"].unique()):
+        tbl_ml = _cuts_for_ml(spi[spi["max_length"] == ml], cut_cols, section, col_prefix)
+        if tbl_ml is not None:
+            parts[ml] = tbl_ml
+    if not parts:
+        return pd.DataFrame()
+    tbl = pd.concat(parts, axis=1)
+    tbl.columns.names = ["T_max", "inst"]
+    return tbl.apply(pd.to_numeric, errors="coerce").round(1)
+
+
+def build_aggregate_tables(
+    summary_level: pd.DataFrame | None,
+    summary_per_inst: pd.DataFrame | None,
+    variant: str | None,
+) -> dict[str, pd.DataFrame]:
+    if summary_level is None or summary_per_inst is None:
+        return {}
+    if summary_level.empty or summary_per_inst.empty:
+        return {}
+    return {
+        "agg_solution_count": make_solution_count(summary_per_inst),
+        "agg_solution_count_bold": make_solution_count_bold(summary_per_inst, summary_level),
+        "agg_completion_time": make_completion_time(summary_level, variant),
+        "agg_cuts_total": make_cuts_table(summary_per_inst, variant, "count_cuts"),
+        "agg_cuts_avg": make_cuts_table(summary_per_inst, variant, "avg_cuts"),
+    }
+
+
+def write_aggregate_tables(
+    output_dir: str,
+    summary_level: pd.DataFrame | None,
+    summary_per_inst: pd.DataFrame | None,
+    variant: str | None,
+) -> list[str]:
+    written: list[str] = []
+    agg_tables = build_aggregate_tables(summary_level, summary_per_inst, variant)
+    for name, tbl in agg_tables.items():
+        print(f"\n  {name:<30}", end="", flush=True)
+        if tbl is None or tbl.empty:
+            print("  (no data)")
+            continue
+        out_path = os.path.join(output_dir, f"{name}.csv")
+        tbl.to_csv(out_path)
+        print(f"{str(tbl.shape):>12}  →  {out_path}")
+        written.append(out_path)
+    return written
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Scan a folder for experiment subdirectories and export summary "
-            "CSV tables to an output directory."
+            "Build summary and aggregate CSV tables from experiment folders "
+            "or from existing summary CSV files."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
         "folder",
-        help="Folder that contains experiment subdirectories.",
+        help=(
+            "Input folder. Default mode: experiment root folder. "
+            "With --from-summary: folder containing summary.csv and summary_per_inst.csv."
+        ),
     )
     parser.add_argument(
         "-o", "--output",
@@ -442,12 +653,51 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--variant",
+        default=None,
+        choices=["agg", "decomp"],
+        help="Restrict completion-time and cuts aggregate tables to one variant.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="Print detected experiments and exit without computing anything.",
     )
+    parser.add_argument(
+        "--from-summary",
+        action="store_true",
+        help="Read summary.csv and summary_per_inst.csv from <folder> and only write aggregate tables.",
+    )
 
     args = parser.parse_args()
+
+    # --- Aggregate-only mode (from existing summary CSV files) --------------
+    if args.from_summary:
+        summary_path = os.path.join(args.folder, "summary.csv")
+        summary_per_inst_path = os.path.join(args.folder, "summary_per_inst.csv")
+        if not os.path.exists(summary_path) or not os.path.exists(summary_per_inst_path):
+            print(
+                "Missing summary files. Expected both:\n"
+                f"  {summary_path}\n"
+                f"  {summary_per_inst_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        output_dir = args.output or args.folder
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Output directory: {output_dir}")
+        print(f"Loading summaries from '{args.folder}'...")
+        summary = pd.read_csv(summary_path)
+        summary_per_inst = pd.read_csv(summary_per_inst_path)
+        written = write_aggregate_tables(
+            output_dir=output_dir,
+            summary_level=summary,
+            summary_per_inst=summary_per_inst,
+            variant=args.variant,
+        )
+        print(f"\nDone. {len(written)} CSV file(s) written to '{output_dir}'.")
+        return
 
     # --- Detect experiments -------------------------------------------------
     experiments = scan_experiments(args.folder)
@@ -489,9 +739,10 @@ def main() -> None:
 
     # --- Build and write summary tables -------------------------------------
     written = []
-    for label, builder, fname in [
-        ("summary (per level)",    build_summary_table,   "summary.csv"),
-        ("summary (per inst)",     build_per_inst_table,  "summary_per_inst.csv"),
+    summary_outputs: dict[str, pd.DataFrame] = {}
+    for key, label, builder, fname in [
+        ("summary", "summary (per level)", build_summary_table, "summary.csv"),
+        ("summary_per_inst", "summary (per inst)", build_per_inst_table, "summary_per_inst.csv"),
     ]:
         print(f"\n  {label:<30}", end="", flush=True)
         df = builder(metric_dfs)
@@ -500,8 +751,18 @@ def main() -> None:
             df.to_csv(out_path, index=False)
             print(f"{len(df):>6} rows  →  {out_path}")
             written.append(out_path)
+            summary_outputs[key] = df
         else:
             print("  (no data)")
+
+    written.extend(
+        write_aggregate_tables(
+            output_dir=output_dir,
+            summary_level=summary_outputs.get("summary"),
+            summary_per_inst=summary_outputs.get("summary_per_inst"),
+            variant=args.variant,
+        )
+    )
 
     print(f"\nDone. {len(written)} CSV file(s) written to '{output_dir}'.")
 
