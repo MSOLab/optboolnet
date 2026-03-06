@@ -87,6 +87,7 @@ def make_solution_count_bold(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame
             finished.groupby(keys, as_index=False)["level"].max()
             .rename(columns={"level": "finished_level"})
         )
+        finished_max["finished_level"] = pd.to_numeric(finished_max["finished_level"], errors="coerce")
 
         # Determine required top level.
         # Preferred: max_control_size from summary_per_inst.
@@ -254,6 +255,9 @@ def main() -> None:
     rd = args.results_dir
     df = pd.read_csv(os.path.join(rd, "summary_per_inst.csv"))
     ct = pd.read_csv(os.path.join(rd, "completion_time.csv"))
+    ct["level"] = pd.to_numeric(ct["level"], errors="coerce")
+    ct["completion_time"] = pd.to_numeric(ct["completion_time"], errors="coerce")
+    ct = ct[ct["level"].notna()]
 
     tables = {
         "agg_solution_count":      make_solution_count(df),
