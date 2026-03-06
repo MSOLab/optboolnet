@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -47,9 +48,12 @@ def _find_alg_subdir(exp_dir: str) -> str | None:
     except PermissionError:
         return None
     for entry in entries:
-        for inst in inst_list:
-            if os.path.isdir(os.path.join(entry.path, inst)):
-                return entry.name
+        try:
+            child_names = {c.name for c in os.scandir(entry.path) if c.is_dir()}
+        except PermissionError:
+            continue
+        if any(inst in child_names for inst in inst_list):
+            return entry.name
     return None
 
 
@@ -90,12 +94,46 @@ def read_alg_config(exp_dir: str) -> dict:
         return {}
 
 
+@dataclass
+class ExperimentContext:
+    exp_name: str
+    exp_dir: str
+    alg: str
+    config: dict
+    exp: Experiment
+
+
+def build_experiment_contexts(experiments: list[tuple[str, str, str]]) -> list[ExperimentContext]:
+    """
+    Build Experiment objects once and keep config metadata cached for reuse
+    across all metrics.
+    """
+    contexts: list[ExperimentContext] = []
+    for exp_name, exp_dir, alg in experiments:
+        config = read_alg_config(exp_dir)
+        try:
+            exp = Experiment(exp_dir, alg, ["experiment"], [exp_name])
+        except Exception as exc:
+            print(f"  [skip] {exp_name}/{alg}: {exc}", file=sys.stderr)
+            continue
+        contexts.append(
+            ExperimentContext(
+                exp_name=exp_name,
+                exp_dir=exp_dir,
+                alg=alg,
+                config=config,
+                exp=exp,
+            )
+        )
+    return contexts
+
+
 # ---------------------------------------------------------------------------
 # Metric collection
 # ---------------------------------------------------------------------------
 
 def collect_metric(
-    experiments: list[tuple[str, str, str]],
+    contexts: list[ExperimentContext],
     metric: str,
 ) -> pd.DataFrame | None:
     """
@@ -103,17 +141,15 @@ def collect_metric(
     with 'experiment' and 'max_length' label columns, or None if all failed.
     """
     frames = []
-    for exp_name, exp_dir, alg in experiments:
+    for ctx in contexts:
         try:
-            config = read_alg_config(exp_dir)
-            exp = Experiment(exp_dir, alg, ["experiment"], [exp_name])
-            df = exp.get_agg_table(metric)
-            df["max_length"] = config.get("max_length", None)
-            df["max_control_size"] = config.get("max_control_size", None)
+            df = ctx.exp.get_agg_table(metric)
+            df["max_length"] = ctx.config.get("max_length", None)
+            df["max_control_size"] = ctx.config.get("max_control_size", None)
             frames.append(df)
         except Exception as exc:
             print(
-                f"  [skip] {exp_name}/{alg}/{metric}: {exc}",
+                f"  [skip] {ctx.exp_name}/{ctx.alg}/{metric}: {exc}",
                 file=sys.stderr,
             )
     if not frames:
@@ -439,6 +475,11 @@ def main() -> None:
     if args.list:
         return
 
+    contexts = build_experiment_contexts(experiments)
+    if not contexts:
+        print("No loadable experiments after initialization.", file=sys.stderr)
+        sys.exit(1)
+
     # --- Compute and write metrics ------------------------------------------
     output_dir = args.output or os.path.join(args.folder, "_results")
     os.makedirs(output_dir, exist_ok=True)
@@ -450,7 +491,7 @@ def main() -> None:
 
     for metric in args.metrics:
         print(f"  {metric:<30}", end="", flush=True)
-        df = collect_metric(experiments, metric)
+        df = collect_metric(contexts, metric)
         if df is not None and not df.empty:
             metric_dfs[metric] = df
             out_path = os.path.join(output_dir, f"{metric}.csv")
