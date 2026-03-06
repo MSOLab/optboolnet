@@ -76,15 +76,19 @@ def _ctrl_key(ctrl: Control) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Persistent JSON cache  {inst -> {ctrl_json_key -> ok}}
+# Persistent JSON caches:
+#   checker_positive.json: {inst -> {ctrl_json_key -> true}}
+#   checker_negative.json: {inst -> {ctrl_json_key -> loop_len}}
 #
-# _checker_data mirrors the on-disk JSON so we never re-read the file on
-# every update.  All writes go through _flush_checker_json which does an
+# _checker_positive_data / _checker_negative_data mirror on-disk JSON so we
+# never re-read the files on every update.  All writes go through
+# _flush_checker_json which does an
 # atomic rename, so a killed process cannot corrupt the file.
 # _checker_lock serialises updates in the (single) main process.
 # ---------------------------------------------------------------------------
 
-_checker_data: Dict[str, Dict[str, bool]] = {}
+_checker_positive_data: Dict[str, Dict[str, bool]] = {}
+_checker_negative_data: Dict[str, Dict[str, int]] = {}
 _checker_lock = threading.Lock()
 
 
@@ -97,42 +101,166 @@ def _json_key_to_cache_key(inst: str, json_key: str) -> tuple:
     return (inst, tuple((k, v) for k, v in json.loads(json_key)))
 
 
-def _flush_checker_json(json_path: str) -> None:
-    """Atomically overwrite json_path from _checker_data."""
+def _flush_checker_json(json_path: str, data: Dict[str, Dict[str, object]]) -> None:
+    """Atomically overwrite json_path from provided cache data."""
     tmp = json_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_checker_data, f, indent=2)
+        json.dump(data, f, indent=2)
     os.replace(tmp, json_path)
 
 
-def load_checker_json(json_path: str) -> int:
-    """Load checker.json into _checker_data and populate _result_cache.
-
-    Returns the number of entries loaded.
-    """
-    global _checker_data
-    if not os.path.exists(json_path):
-        return 0
-    with open(json_path, "r", encoding="utf-8") as f:
-        _checker_data = json.load(f)
+def _merge_cache_into_result_cache(data: Dict[str, Dict[str, object]], ok_value: bool) -> int:
     count = 0
-    for inst, ctrl_map in _checker_data.items():
-        for jk, ok in ctrl_map.items():
-            _result_cache[_json_key_to_cache_key(inst, jk)] = ok
+    for inst, ctrl_map in data.items():
+        for jk in ctrl_map.keys():
+            _result_cache[_json_key_to_cache_key(inst, jk)] = ok_value
             count += 1
     return count
 
 
-def update_checker_json(json_path: str, inst: str, ctrl: Control, ok: bool) -> None:
-    """Thread-safe: add one result to _checker_data and flush to disk."""
+def _load_single_cache(json_path: str) -> Dict[str, Dict[str, object]]:
+    if not os.path.exists(json_path):
+        return {}
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _normalize_negative_len(value: object) -> int:
+    """Normalize cached loop length to an integer (-1 = unknown)."""
+    if isinstance(value, bool):
+        return -1
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return iv if iv > 0 else -1
+
+
+def _normalize_negative_cache(data: Dict[str, Dict[str, object]]) -> Tuple[Dict[str, Dict[str, int]], bool]:
+    normalized: Dict[str, Dict[str, int]] = {}
+    changed = False
+    for inst, ctrl_map in data.items():
+        if not isinstance(ctrl_map, dict):
+            changed = True
+            continue
+        for jk, raw_len in ctrl_map.items():
+            norm_len = _normalize_negative_len(raw_len)
+            normalized.setdefault(inst, {})[jk] = norm_len
+            if raw_len != norm_len:
+                changed = True
+    return normalized, changed
+
+
+def _normalize_positive_cache(data: Dict[str, Dict[str, object]]) -> Tuple[Dict[str, Dict[str, bool]], bool]:
+    normalized: Dict[str, Dict[str, bool]] = {}
+    changed = False
+    for inst, ctrl_map in data.items():
+        if not isinstance(ctrl_map, dict):
+            changed = True
+            continue
+        for jk, raw_ok in ctrl_map.items():
+            if bool(raw_ok):
+                normalized.setdefault(inst, {})[jk] = True
+            else:
+                changed = True
+            if raw_ok is not True:
+                changed = True
+    return normalized, changed
+
+
+def load_checker_jsons(
+    positive_path: str,
+    negative_path: str,
+    legacy_path: Optional[str] = None,
+) -> Tuple[int, int, int]:
+    """Load positive/negative caches and optionally migrate legacy checker.json.
+
+    Returns (positive_count, negative_count, migrated_from_legacy_count).
+    """
+    global _checker_positive_data, _checker_negative_data
+    pos_exists = os.path.exists(positive_path)
+    neg_exists = os.path.exists(negative_path)
+    _checker_positive_data, pos_normalized = _normalize_positive_cache(
+        _load_single_cache(positive_path)
+    )
+    _checker_negative_data, neg_normalized = _normalize_negative_cache(
+        _load_single_cache(negative_path)
+    )
+
+    migrated = 0
+    should_try_legacy_migration = (
+        legacy_path
+        and os.path.exists(legacy_path)
+        and (not pos_exists or not neg_exists)
+    )
+    if should_try_legacy_migration:
+        with open(legacy_path, "r", encoding="utf-8") as f:
+            legacy = json.load(f)
+        if isinstance(legacy, dict):
+            for inst, ctrl_map in legacy.items():
+                if not isinstance(ctrl_map, dict):
+                    continue
+                for jk, ok in ctrl_map.items():
+                    if ok:
+                        if jk not in _checker_positive_data.get(inst, {}):
+                            _checker_positive_data.setdefault(inst, {})[jk] = True
+                            _checker_negative_data.get(inst, {}).pop(jk, None)
+                            migrated += 1
+                    else:
+                        if jk not in _checker_negative_data.get(inst, {}):
+                            _checker_negative_data.setdefault(inst, {})[jk] = -1
+                            _checker_positive_data.get(inst, {}).pop(jk, None)
+                            migrated += 1
+            if migrated > 0 or pos_normalized or neg_normalized:
+                _flush_checker_json(positive_path, _checker_positive_data)
+                _flush_checker_json(negative_path, _checker_negative_data)
+    elif pos_normalized or neg_normalized:
+        if pos_normalized:
+            _flush_checker_json(positive_path, _checker_positive_data)
+        if neg_normalized:
+            _flush_checker_json(negative_path, _checker_negative_data)
+
+    pos_count = _merge_cache_into_result_cache(_checker_positive_data, True)
+    neg_count = _merge_cache_into_result_cache(_checker_negative_data, False)
+    return pos_count, neg_count, migrated
+
+
+def update_checker_jsons(
+    positive_path: str,
+    negative_path: str,
+    inst: str,
+    ctrl: Control,
+    ok: bool,
+    counterexample_len: Optional[int] = None,
+) -> None:
+    """Thread-safe: add one result to the correct cache and flush to disk."""
     jk = _ctrl_json_key(ctrl)
     with _checker_lock:
-        _checker_data.setdefault(inst, {})[jk] = ok
-        _flush_checker_json(json_path)
+        if ok:
+            removed = jk in _checker_negative_data.get(inst, {})
+            _checker_positive_data.setdefault(inst, {})[jk] = True
+            _checker_negative_data.get(inst, {}).pop(jk, None)
+            _flush_checker_json(positive_path, _checker_positive_data)
+            if removed:
+                _flush_checker_json(negative_path, _checker_negative_data)
+        else:
+            neg_len = _normalize_negative_len(counterexample_len)
+            existing = _checker_negative_data.get(inst, {}).get(jk)
+            # Do not degrade known loop lengths to unknown (-1).
+            if existing is None or (existing == -1 and neg_len > 0) or (existing > 0 and neg_len > 0 and existing != neg_len):
+                _checker_negative_data.setdefault(inst, {})[jk] = neg_len
+            removed = jk in _checker_positive_data.get(inst, {})
+            _checker_positive_data.get(inst, {}).pop(jk, None)
+            _flush_checker_json(negative_path, _checker_negative_data)
+            if removed:
+                _flush_checker_json(positive_path, _checker_positive_data)
 
 
-def extract_from_log(log_path: str, json_path: str) -> int:
-    """Parse an existing log file and bootstrap / update checker.json.
+def extract_from_log(log_path: str, positive_path: str, negative_path: str) -> int:
+    """Parse an existing log file and bootstrap / update checker caches.
 
     Lines handled:
         work_dir,inst,{ctrl_dict},OK
@@ -144,6 +272,7 @@ def extract_from_log(log_path: str, json_path: str) -> int:
     if not os.path.exists(log_path):
         return 0
     count = 0
+    changed = False
     with open(log_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -156,22 +285,45 @@ def extract_from_log(log_path: str, json_path: str) -> int:
                 continue
             inst = parts[1]
             rest = parts[2]
-            m = re.match(r"(\{[^}]*\}),(OK|INCORRECT)(?:,|$)", rest)
+            m = re.match(r"(\{[^}]*\}),(OK|INCORRECT)(?:,(.*))?$", rest)
             if not m:
                 continue
-            ctrl_str, status = m.group(1), m.group(2)
+            ctrl_str, status, tail = m.group(1), m.group(2), (m.group(3) or "")
             try:
                 ctrl_dict = ast.literal_eval(ctrl_str)
             except (ValueError, SyntaxError):
                 continue
             jk = json.dumps(sorted(ctrl_dict.items()))
-            if jk not in _checker_data.get(inst, {}):
-                _checker_data.setdefault(inst, {})[jk] = (status == "OK")
-                # also update _result_cache so duplicates within this run are skipped
-                _result_cache[_json_key_to_cache_key(inst, jk)] = (status == "OK")
-                count += 1
-    if count:
-        _flush_checker_json(json_path)
+            if status == "OK":
+                if jk not in _checker_positive_data.get(inst, {}):
+                    _checker_positive_data.setdefault(inst, {})[jk] = True
+                    _checker_negative_data.get(inst, {}).pop(jk, None)
+                    _result_cache[_json_key_to_cache_key(inst, jk)] = True
+                    count += 1
+                    changed = True
+            else:
+                neg_len = -1
+                tail_parts = tail.split(",") if tail else []
+                if len(tail_parts) >= 2 and tail_parts[0] == "LOOP_LEN":
+                    neg_len = _normalize_negative_len(tail_parts[1])
+                old_len = _checker_negative_data.get(inst, {}).get(jk)
+                should_update = (
+                    old_len is None
+                    or (old_len == -1 and neg_len > 0)
+                    or (old_len > 0 and neg_len > 0 and old_len != neg_len)
+                )
+                if should_update:
+                    _checker_negative_data.setdefault(inst, {})[jk] = neg_len
+                    if old_len is None:
+                        count += 1
+                    changed = True
+                if jk in _checker_positive_data.get(inst, {}):
+                    _checker_positive_data[inst].pop(jk, None)
+                    changed = True
+                _result_cache[_json_key_to_cache_key(inst, jk)] = False
+    if changed:
+        _flush_checker_json(positive_path, _checker_positive_data)
+        _flush_checker_json(negative_path, _checker_negative_data)
     return count
 
 
@@ -254,7 +406,8 @@ def verify_all(
     output_file: str,
     instances: List[str],
     workers: int,
-    json_path: str,
+    json_positive_path: str,
+    json_negative_path: str,
     logic: str = "ctl",
 ) -> List[Tuple[str, str, Control]]:
     """
@@ -284,8 +437,7 @@ def verify_all(
         return []
 
     # Phase 2: split cached vs to-run.
-    # In LTL mode, recompute all controls because boolean cache does not store
-    # loop lengths and we want LOOP_LEN logged in the output.
+    # In LTL mode, recompute all controls so LOOP_LEN is always logged in output.
     to_run: List[Tuple[str, str, Control, tuple]] = []
     for work_dir, inst, ctrl in all_triplets:
         key = (inst, _ctrl_key(ctrl))
@@ -352,7 +504,14 @@ def verify_all(
                 loop_len = None
 
             _result_cache[key] = ok
-            update_checker_json(json_path, inst, ctrl, ok)
+            update_checker_jsons(
+                json_positive_path,
+                json_negative_path,
+                inst,
+                ctrl,
+                ok,
+                counterexample_len=(loop_len if logic == "ltl" and not ok else None),
+            )
             _log_result(
                 output_file,
                 work_dir,
@@ -466,10 +625,32 @@ if __name__ == "__main__":
         help=f"Number of parallel NuSMV processes (default: cpu_count={os.cpu_count()})",
     )
     ap.add_argument(
-        "--json",
+        "--json-positive",
+        metavar="FILE",
+        default="_experiments/checker_positive.json",
+        help=(
+            "Persistent JSON cache for positive checks "
+            "(default: _experiments/checker_positive.json)"
+        ),
+    )
+    ap.add_argument(
+        "--json-negative",
+        metavar="FILE",
+        default="_experiments/checker_negative.json",
+        help=(
+            "Persistent JSON cache for negative checks "
+            "(value = counterexample loop length; CTL stores -1) "
+            "(default: _experiments/checker_negative.json)"
+        ),
+    )
+    ap.add_argument(
+        "--json-legacy",
         metavar="FILE",
         default="_experiments/checker.json",
-        help="Persistent JSON cache for check results (default: _experiments/checker.json)",
+        help=(
+            "Optional legacy checker cache to migrate from "
+            "(default: _experiments/checker.json)"
+        ),
     )
     ap.add_argument(
         "--logic",
@@ -479,9 +660,22 @@ if __name__ == "__main__":
     )
     args = ap.parse_args()
 
-    n = load_checker_json(args.json)
-    if n:
-        print(f"Loaded {n} cached result(s) from {args.json}")
+    n_pos, n_neg, n_migrated = load_checker_jsons(
+        args.json_positive,
+        args.json_negative,
+        legacy_path=args.json_legacy,
+    )
+    if n_migrated:
+        print(
+            f"Migrated {n_migrated} cached result(s) from {args.json_legacy} "
+            f"to {args.json_positive} / {args.json_negative}"
+        )
+    loaded_total = n_pos + n_neg
+    if loaded_total:
+        print(
+            f"Loaded {loaded_total} cached result(s): "
+            f"{n_pos} positive, {n_neg} negative"
+        )
 
     _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
@@ -513,7 +707,8 @@ if __name__ == "__main__":
         args.output,
         args.instances,
         args.workers,
-        args.json,
+        args.json_positive,
+        args.json_negative,
         logic=args.logic,
     )
 
