@@ -7,6 +7,7 @@ from multiprocessing.pool import ApplyResult
 import os
 import re
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 from optboolnet.boolnet import Control
@@ -165,10 +166,34 @@ def _parse_cached_len(value: object) -> Optional[int]:
 
 
 def _flush_checker_json(json_path: str, data: Dict[str, Dict[str, int]]) -> None:
-    tmp = json_path + ".tmp"
+    tmp = f"{json_path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp, json_path)
+
+    delays = [0.05, 0.1, 0.2, 0.5, 1.0]
+    last_err: Optional[PermissionError] = None
+    for delay in delays:
+        try:
+            os.replace(tmp, json_path)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            time.sleep(delay)
+
+    try:
+        os.replace(tmp, json_path)
+        return
+    except PermissionError as exc:
+        last_err = exc
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    if last_err is not None:
+        raise last_err
 
 
 def _load_single_cache(json_path: str) -> Dict[str, Dict[str, object]]:
@@ -205,7 +230,10 @@ def load_checker_json(json_path: str, max_length: int) -> int:
     global _checker_data
     _checker_data, normalized = _normalize_cache(_load_single_cache(json_path))
     if normalized:
-        _flush_checker_json(json_path, _checker_data)
+        try:
+            _flush_checker_json(json_path, _checker_data)
+        except PermissionError as exc:
+            print(f"[WARN] cache file is locked; skip normalize write now: {json_path} ({exc})")
 
     count = 0
     for inst, ctrl_map in _checker_data.items():
@@ -237,7 +265,10 @@ def update_checker_json(
         if not _should_update_cached_len(old_len, min_viol_len):
             return
         _checker_data.setdefault(inst, {})[jk] = min_viol_len
-        _flush_checker_json(json_path, _checker_data)
+        try:
+            _flush_checker_json(json_path, _checker_data)
+        except PermissionError as exc:
+            print(f"[WARN] cache write skipped (locked): {json_path} ({exc})")
 
 
 def extract_from_log(log_path: str, cache_path: str, max_length: int) -> int:
@@ -278,7 +309,10 @@ def extract_from_log(log_path: str, cache_path: str, max_length: int) -> int:
                     count += 1
                 changed = True
     if changed:
-        _flush_checker_json(cache_path, _checker_data)
+        try:
+            _flush_checker_json(cache_path, _checker_data)
+        except PermissionError as exc:
+            print(f"[WARN] cache write skipped after bootstrap (locked): {cache_path} ({exc})")
     return count
 
 
@@ -375,44 +409,67 @@ def verify_all(
         f"across {n_wds} experiment(s), {workers} subproblem workers [T={max_length}]"
     )
 
+    # Process by fixed instance first, then iterate experiments sequentially.
+    # This keeps the same worker pool alive for that instance and lets workers
+    # reuse their cached (instance, length) models across experiments.
+    inst_to_wdis: Dict[str, List[Tuple[str, List[Control]]]] = {}
     for (work_dir, inst), ctrl_list in wdi_ctrls.items():
-        total_for_inst = len(ctrl_list)
-        completed_for_inst = 0
-        last_pct = 0
+        inst_to_wdis.setdefault(inst, []).append((work_dir, ctrl_list))
+
+    for inst in instances:
+        wdis = inst_to_wdis.get(inst, [])
+        if not wdis:
+            continue
+        wdis.sort(key=lambda x: x[0])
+
+        total_for_fixed_inst = sum(len(ctrl_list) for _, ctrl_list in wdis)
+        print(
+            f"[{inst}] {len(wdis)} experiment(s), {total_for_fixed_inst} control(s) "
+            f"with shared subproblem workers"
+        )
+
         n_workers_inst = max(1, min(workers, max_length))
         length_shards = _partition_lengths_mod(max_length, n_workers_inst)
         worker_pools = [mp.Pool(processes=1) for _ in range(n_workers_inst)]
         try:
-            for ctrl in ctrl_list:
-                key = (inst, _ctrl_key(ctrl), max_length)
-                if key in _result_cache:
-                    min_viol_len = _result_cache[key]
-                else:
-                    min_viol_len = _find_min_viol_len_for_inst(
-                        inst,
-                        ctrl,
-                        length_shards,
-                        worker_pools,
-                    )
-                    _result_cache[key] = min_viol_len
-                    update_checker_json(cache_path, inst, ctrl, min_viol_len)
+            for work_dir, ctrl_list in wdis:
+                total_for_wdi = len(ctrl_list)
+                completed_for_wdi = 0
+                last_pct = 0
 
-                _log_result(output_file, work_dir, inst, ctrl, min_viol_len)
+                for ctrl in ctrl_list:
+                    key = (inst, _ctrl_key(ctrl), max_length)
+                    if key in _result_cache:
+                        min_viol_len = _result_cache[key]
+                    else:
+                        min_viol_len = _find_min_viol_len_for_inst(
+                            inst,
+                            ctrl,
+                            length_shards,
+                            worker_pools,
+                        )
+                        _result_cache[key] = min_viol_len
+                        update_checker_json(cache_path, inst, ctrl, min_viol_len)
 
-                completed_for_inst += 1
-                pct = completed_for_inst * 100 // total_for_inst
-                milestone = pct // 10 * 10
-                if milestone > last_pct:
-                    tag = os.path.basename(work_dir)
-                    print(f"\t[{tag}/{inst}] {milestone}% ({completed_for_inst}/{total_for_inst})")
-                    last_pct = milestone
+                    _log_result(output_file, work_dir, inst, ctrl, min_viol_len)
+
+                    completed_for_wdi += 1
+                    pct = completed_for_wdi * 100 // total_for_wdi
+                    milestone = pct // 10 * 10
+                    if milestone > last_pct:
+                        tag = os.path.basename(work_dir)
+                        print(
+                            f"\t[{tag}/{inst}] {milestone}% "
+                            f"({completed_for_wdi}/{total_for_wdi})"
+                        )
+                        last_pct = milestone
+
+                _log_instance_done(output_file, work_dir, inst)
         finally:
             for pool in worker_pools:
                 pool.close()
             for pool in worker_pools:
                 pool.join()
-
-        _log_instance_done(output_file, work_dir, inst)
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +608,8 @@ if __name__ == "__main__":
         args.T,
         cache_path,
     )
+
+    try:
+        _flush_checker_json(cache_path, _checker_data)
+    except PermissionError as exc:
+        print(f"[WARN] final cache flush skipped (locked): {cache_path} ({exc})")
