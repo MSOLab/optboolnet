@@ -24,7 +24,8 @@ _ALGO_SUBDIRS = ["benders", "MibS"]
 # ---------------------------------------------------------------------------
 
 _worker_bns: Dict[str, object] = {}
-_worker_models: Dict[Tuple[str, int], AggregatedAttractorDetectionIP] = {}
+_worker_models_viol: Dict[Tuple[str, int], AggregatedAttractorDetectionIP] = {}
+_worker_models_any: Dict[Tuple[str, int], AggregatedAttractorDetectionIP] = {}
 
 
 def _get_worker_bn(inst_name: str):
@@ -37,48 +38,83 @@ def _solve_single_length_subproblem(
     inst_name: str,
     ctrl: Control,
     length: int,
-) -> Tuple[int, bool]:
-    """Solve one fixed-length LLP and report whether it yields a violating attractor."""
+) -> Tuple[int, bool, bool]:
+    """Solve one fixed-length LLP and report attractor existence + violating existence."""
     key = (inst_name, length)
-    if key not in _worker_models:
+    if key not in _worker_models_any:
         bn = _get_worker_bn(inst_name)
-        model_llp = AggregatedAttractorDetectionIP(
-            f"{inst_name}_{length}",
+        model_any = AggregatedAttractorDetectionIP(
+            f"{inst_name}_{length}_any",
             bn,
             length,
             SolverConfig(),
         )
-        model_llp.make_constr_stability_condition()
-        model_llp.make_constr_periodicity()
-        model_llp.make_constr_phenotype_and_length()
-        model_llp.set_phenotype_obj()
-        model_llp.fix_length(length)
-        _worker_models[key] = model_llp
-    model_llp = _worker_models[key]
-    model_llp.fix_control(ctrl)
+        model_any.make_constr_stability_condition()
+        model_any.make_constr_periodicity()
+        model_any.fix_length(length)
+        _worker_models_any[key] = model_any
+    model_any = _worker_models_any[key]
+    model_any.fix_control(ctrl)
 
-    if model_llp.optimize():
-        return length, model_llp.p.value < 0.5
+    if model_any.optimize():
+        has_any = True
+    else:
+        term_any = getattr(model_any, "last_termination_condition", None)
+        if term_any == TerminationCondition.infeasible:
+            has_any = False
+        elif term_any == TerminationCondition.maxTimeLimit:
+            has_any = True
+        else:
+            has_any = True
 
-    term = getattr(model_llp, "last_termination_condition", None)
-    if term == TerminationCondition.infeasible:
-        return length, False
-    if term == TerminationCondition.maxTimeLimit:
-        return length, True
-    return length, True
+    if not has_any:
+        return length, False, False
+
+    if key not in _worker_models_viol:
+        bn = _get_worker_bn(inst_name)
+        model_viol = AggregatedAttractorDetectionIP(
+            f"{inst_name}_{length}_viol",
+            bn,
+            length,
+            SolverConfig(),
+        )
+        model_viol.make_constr_stability_condition()
+        model_viol.make_constr_periodicity()
+        model_viol.make_constr_phenotype_and_length()
+        model_viol.set_phenotype_obj()
+        model_viol.fix_length(length)
+        _worker_models_viol[key] = model_viol
+    model_viol = _worker_models_viol[key]
+    model_viol.fix_control(ctrl)
+
+    if model_viol.optimize():
+        return length, True, model_viol.p.value < 0.5
+
+    term_viol = getattr(model_viol, "last_termination_condition", None)
+    if term_viol == TerminationCondition.infeasible:
+        return length, True, False
+    if term_viol == TerminationCondition.maxTimeLimit:
+        return length, True, True
+    return length, True, True
 
 
 def _solve_length_shard(
     inst_name: str,
     ctrl: Control,
     shard_lengths: List[int],
-) -> int:
-    """Solve one worker shard and return min violating length in that shard, else -1."""
+) -> Tuple[int, int]:
+    """Return (min_viol_len, min_attr_len) in this shard, each -1 if absent."""
+    min_viol_len = -1
+    min_attr_len = -1
     for length in shard_lengths:
-        _, is_violating = _solve_single_length_subproblem(inst_name, ctrl, length)
-        if is_violating:
-            return length
-    return -1
+        _, has_any, is_violating = _solve_single_length_subproblem(inst_name, ctrl, length)
+        if has_any and min_attr_len == -1:
+            min_attr_len = length
+        if is_violating and min_viol_len == -1:
+            min_viol_len = length
+        if min_attr_len > 0 and min_viol_len > 0:
+            break
+    return min_viol_len, min_attr_len
 
 
 def _partition_lengths_mod(max_length: int, n_workers: int) -> List[List[int]]:
@@ -88,19 +124,19 @@ def _partition_lengths_mod(max_length: int, n_workers: int) -> List[List[int]]:
     return shards
 
 
-def _find_min_viol_len_for_inst(
+def _find_min_lens_for_inst(
     inst_name: str,
     ctrl: Control,
     length_shards: List[List[int]],
     worker_pools: List[mp.Pool],
-) -> int:
-    """Find min violating length from statically assigned shards.
+) -> Tuple[int, int]:
+    """Find (min_viol_len, min_attr_len) from statically assigned shards.
 
     Reuses worker-local models for (instance, length) across controls, and assigns
     lengths with round-robin mod worker_count.
     """
     if not length_shards:
-        return -1
+        return -1, -1
 
     n_workers = len(length_shards)
     if n_workers == 1:
@@ -117,21 +153,26 @@ def _find_min_viol_len_for_inst(
             )
         )
 
-    best_violation = -1
+    best_viol = -1
+    best_attr = -1
     for async_result in pending:
-        local_min = _normalize_len(async_result.get())
-        if local_min > 0 and (best_violation == -1 or local_min < best_violation):
-            best_violation = local_min
-    return best_violation
+        local_viol, local_attr = async_result.get()
+        local_viol = _normalize_len(local_viol)
+        local_attr = _normalize_len(local_attr)
+        if local_viol > 0 and (best_viol == -1 or local_viol < best_viol):
+            best_viol = local_viol
+        if local_attr > 0 and (best_attr == -1 or local_attr < best_attr):
+            best_attr = local_attr
+    return best_viol, best_attr
 
 
 # ---------------------------------------------------------------------------
 # Main-process result cache and persistent cache
-# Key: (inst_name, ctrl_key, T)  Value: min_viol_len (-1 or >=1)
+# Key: (inst_name, ctrl_key, T)  Value: (min_viol_len, min_attr_len)
 # ---------------------------------------------------------------------------
 
-_result_cache: Dict[tuple, int] = {}
-_checker_data: Dict[str, Dict[str, int]] = {}
+_result_cache: Dict[tuple, Tuple[int, int]] = {}
+_checker_data: Dict[str, Dict[str, Dict[str, int]]] = {}
 _checker_lock = threading.Lock()
 
 
@@ -165,7 +206,17 @@ def _parse_cached_len(value: object) -> Optional[int]:
     return iv if iv > 0 else -1
 
 
-def _flush_checker_json(json_path: str, data: Dict[str, Dict[str, int]]) -> None:
+def _parse_cached_pair(value: object) -> Optional[Tuple[int, int]]:
+    if not isinstance(value, dict):
+        return None
+    min_viol = _parse_cached_len(value.get("min_attr_len_viol"))
+    min_attr = _parse_cached_len(value.get("min_attr_len"))
+    if min_viol is None or min_attr is None:
+        return None
+    return min_viol, min_attr
+
+
+def _flush_checker_json(json_path: str, data: Dict[str, Dict[str, Dict[str, int]]]) -> None:
     tmp = f"{json_path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -208,20 +259,24 @@ def _load_single_cache(json_path: str) -> Dict[str, Dict[str, object]]:
 
 def _normalize_cache(
     data: Dict[str, Dict[str, object]]
-) -> Tuple[Dict[str, Dict[str, int]], bool]:
-    normalized: Dict[str, Dict[str, int]] = {}
+) -> Tuple[Dict[str, Dict[str, Dict[str, int]]], bool]:
+    normalized: Dict[str, Dict[str, Dict[str, int]]] = {}
     changed = False
     for inst, ctrl_map in data.items():
         if not isinstance(ctrl_map, dict):
             changed = True
             continue
-        for jk, raw_len in ctrl_map.items():
-            norm_len = _parse_cached_len(raw_len)
-            if norm_len is None:
+        for jk, raw_pair in ctrl_map.items():
+            norm_pair = _parse_cached_pair(raw_pair)
+            if norm_pair is None:
                 changed = True
                 continue
-            normalized.setdefault(inst, {})[jk] = norm_len
-            if raw_len != norm_len:
+            min_viol, min_attr = norm_pair
+            normalized.setdefault(inst, {})[jk] = {
+                "min_attr_len_viol": min_viol,
+                "min_attr_len": min_attr,
+            }
+            if not isinstance(raw_pair, dict):
                 changed = True
     return normalized, changed
 
@@ -237,8 +292,13 @@ def load_checker_json(json_path: str, max_length: int) -> int:
 
     count = 0
     for inst, ctrl_map in _checker_data.items():
-        for jk, min_viol_len in ctrl_map.items():
-            _result_cache[_json_key_to_cache_key(inst, jk, max_length)] = min_viol_len
+        for jk, pair_data in ctrl_map.items():
+            min_viol_len = _normalize_len(pair_data.get("min_attr_len_viol"))
+            min_attr_len = _normalize_len(pair_data.get("min_attr_len"))
+            _result_cache[_json_key_to_cache_key(inst, jk, max_length)] = (
+                min_viol_len,
+                min_attr_len,
+            )
             count += 1
     return count
 
@@ -253,18 +313,33 @@ def _should_update_cached_len(old_len: Optional[int], new_len: int) -> bool:
     return False
 
 
+def _merge_cached_len(old_len: Optional[int], new_len: int) -> int:
+    if _should_update_cached_len(old_len, new_len):
+        return new_len
+    return old_len if old_len is not None else new_len
+
+
 def update_checker_json(
     json_path: str,
     inst: str,
     ctrl: Control,
     min_viol_len: int,
+    min_attr_len: int,
 ) -> None:
     jk = _ctrl_json_key(ctrl)
     with _checker_lock:
-        old_len = _checker_data.get(inst, {}).get(jk)
-        if not _should_update_cached_len(old_len, min_viol_len):
+        old_pair = _checker_data.get(inst, {}).get(jk, {})
+        old_viol = _parse_cached_len(old_pair.get("min_attr_len_viol"))
+        old_attr = _parse_cached_len(old_pair.get("min_attr_len"))
+
+        new_viol = _merge_cached_len(old_viol, min_viol_len)
+        new_attr = _merge_cached_len(old_attr, min_attr_len)
+        if old_viol == new_viol and old_attr == new_attr:
             return
-        _checker_data.setdefault(inst, {})[jk] = min_viol_len
+        _checker_data.setdefault(inst, {})[jk] = {
+            "min_attr_len_viol": new_viol,
+            "min_attr_len": new_attr,
+        }
         try:
             _flush_checker_json(json_path, _checker_data)
         except PermissionError as exc:
@@ -275,7 +350,7 @@ def extract_from_log(log_path: str, cache_path: str, max_length: int) -> int:
     """Bootstrap cache from prior logs.
 
     Lines handled:
-        work_dir,inst,{ctrl_dict},MIN_VIOL_LEN,<n>
+        work_dir,inst,{ctrl_dict},MIN_ATTR_LEN_VIOL,<n>,MIN_ATTR_LEN,<m>
     """
     if not os.path.exists(log_path):
         return 0
@@ -291,21 +366,35 @@ def extract_from_log(log_path: str, cache_path: str, max_length: int) -> int:
                 continue
             inst = parts[1]
             rest = parts[2]
-            m = re.match(r"(\{[^}]*\}),MIN_VIOL_LEN,(-?\d+)$", rest)
+            m = re.match(
+                r"(\{[^}]*\}),MIN_ATTR_LEN_VIOL,(-?\d+),MIN_ATTR_LEN,(-?\d+)$",
+                rest,
+            )
             if not m:
                 continue
-            ctrl_str, len_str = m.group(1), m.group(2)
+            ctrl_str, viol_str, attr_str = m.group(1), m.group(2), m.group(3)
             try:
                 ctrl_dict = ast.literal_eval(ctrl_str)
             except (ValueError, SyntaxError):
                 continue
-            min_viol_len = _normalize_len(len_str)
+            min_viol_len = _normalize_len(viol_str)
+            min_attr_len = _normalize_len(attr_str)
             jk = json.dumps(sorted(ctrl_dict.items()))
-            old_len = _checker_data.get(inst, {}).get(jk)
-            if _should_update_cached_len(old_len, min_viol_len):
-                _checker_data.setdefault(inst, {})[jk] = min_viol_len
-                _result_cache[_json_key_to_cache_key(inst, jk, max_length)] = min_viol_len
-                if old_len is None:
+            old_pair = _checker_data.get(inst, {}).get(jk, {})
+            old_viol = _parse_cached_len(old_pair.get("min_attr_len_viol"))
+            old_attr = _parse_cached_len(old_pair.get("min_attr_len"))
+            new_viol = _merge_cached_len(old_viol, min_viol_len)
+            new_attr = _merge_cached_len(old_attr, min_attr_len)
+            if old_viol != new_viol or old_attr != new_attr:
+                _checker_data.setdefault(inst, {})[jk] = {
+                    "min_attr_len_viol": new_viol,
+                    "min_attr_len": new_attr,
+                }
+                _result_cache[_json_key_to_cache_key(inst, jk, max_length)] = (
+                    new_viol,
+                    new_attr,
+                )
+                if old_viol is None and old_attr is None:
                     count += 1
                 changed = True
     if changed:
@@ -329,19 +418,51 @@ def _find_sol_path(work_dir: str, inst: str) -> Optional[str]:
     return None
 
 
+def _load_alg_max_length(work_dir: str) -> Optional[int]:
+    cfg_path = os.path.join(work_dir, "alg_config.json")
+    if not os.path.exists(cfg_path):
+        return None
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tmax = int(cfg["max_length"])
+        return tmax if tmax >= 1 else None
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _is_valid_control(min_viol_len: int, min_attr_len: int, t_max: int) -> bool:
+    return (1 <= min_attr_len <= t_max) and not (1 <= min_viol_len <= t_max)
+
+
 def _log_result(
     output_file: str,
     work_dir: str,
     inst: str,
     ctrl: Control,
     min_viol_len: int,
+    min_attr_len: int,
 ):
-    if min_viol_len > 0:
-        tag = os.path.basename(work_dir)
-        print(f"\tincorrect [{tag}/{inst}] {ctrl} min_len={min_viol_len}")
-    line = f"{work_dir},{inst},{ctrl},MIN_VIOL_LEN,{min_viol_len}"
+    line = (
+        f"{work_dir},{inst},{ctrl},MIN_ATTR_LEN_VIOL,{min_viol_len},"
+        f"MIN_ATTR_LEN,{min_attr_len}"
+    )
     with open(output_file, "a", encoding="utf-8") as _f:
         _f.write(line + "\n")
+
+
+def _log_error(
+    output_file: str,
+    work_dir: str,
+    inst: str,
+    ctrl: Control,
+    err_type: str,
+    detail: str,
+) -> None:
+    line = f"{work_dir},{inst},{ctrl},ERROR,{err_type},{detail}"
+    with open(output_file, "a", encoding="utf-8") as _f:
+        _f.write(line + "\n")
+
 
 
 def _log_instance_done(output_file: str, work_dir: str, inst: str):
@@ -353,9 +474,32 @@ def _log_instance_done(output_file: str, work_dir: str, inst: str):
 
 
 def _collect_pairs(
-    work_dir: str, instances: List[str], output_file: str
-) -> List[Tuple[str, Control]]:
+    work_dir: str,
+    instances: List[str],
+    output_file: str,
+    check_subset: bool,
+) -> Tuple[
+    List[Tuple[str, Control]],
+    Dict[str, set],
+    Dict[str, Dict[tuple, List[tuple]]],
+]:
+    def _all_subsets(ctrl: Control) -> List[Tuple[tuple, Control]]:
+        items = sorted(ctrl.items())
+        n = len(items)
+        out: List[Tuple[tuple, Control]] = []
+        for mask in range(1 << n):
+            sub = {
+                k: v
+                for i, (k, v) in enumerate(items)
+                if (mask >> i) & 1
+            }
+            sub_ctrl = Control(sub)
+            out.append((_ctrl_key(sub_ctrl), sub_ctrl))
+        return out
+
     pairs: List[Tuple[str, Control]] = []
+    original_keys_by_inst: Dict[str, set] = {}
+    strict_subset_keys_by_original_by_inst: Dict[str, Dict[tuple, List[tuple]]] = {}
     for inst in instances:
         sol_path = _find_sol_path(work_dir, inst)
         if sol_path is None:
@@ -368,9 +512,33 @@ def _collect_pairs(
             for sol_list in json.load(_f).values():
                 for sol in sol_list:
                     ctrl_list.append(Control(sol))
-        pairs.extend((inst, ctrl) for ctrl in ctrl_list)
-        print(f"\t{os.path.basename(work_dir)}/{inst}: {len(ctrl_list)} controls")
-    return pairs
+        original_keys = {_ctrl_key(ctrl) for ctrl in ctrl_list}
+        original_keys_by_inst[inst] = original_keys
+        if check_subset:
+            uniq_subset_ctrls: Dict[tuple, Control] = {}
+            strict_subset_keys_by_original: Dict[tuple, set] = {}
+            for ctrl in ctrl_list:
+                orig_key = _ctrl_key(ctrl)
+                strict_subset_keys_by_original.setdefault(orig_key, set())
+                for sub_ctrl in _all_subsets(ctrl):
+                    sub_key, sub_val = sub_ctrl
+                    uniq_subset_ctrls.setdefault(sub_key, sub_val)
+                    if sub_key != orig_key:
+                        strict_subset_keys_by_original[orig_key].add(sub_key)
+            expanded_ctrls = list(uniq_subset_ctrls.values())
+            strict_subset_keys_by_original_by_inst[inst] = {
+                k: sorted(list(v))
+                for k, v in strict_subset_keys_by_original.items()
+            }
+            pairs.extend((inst, ctrl) for ctrl in expanded_ctrls)
+            print(
+                f"\t{os.path.basename(work_dir)}/{inst}: {len(ctrl_list)} controls "
+                f"-> {len(expanded_ctrls)} unique subsets"
+            )
+        else:
+            pairs.extend((inst, ctrl) for ctrl in ctrl_list)
+            print(f"\t{os.path.basename(work_dir)}/{inst}: {len(ctrl_list)} controls")
+    return pairs, original_keys_by_inst, strict_subset_keys_by_original_by_inst
 
 
 # ---------------------------------------------------------------------------
@@ -385,13 +553,41 @@ def verify_all(
     workers: int,
     max_length: int,
     cache_path: str,
+    check_subset: bool,
 ) -> None:
     wdi_ctrls: Dict[Tuple[str, str], List[Control]] = {}
+    wdi_original_keys: Dict[Tuple[str, str], set] = {}
+    wdi_strict_subset_keys_by_original: Dict[Tuple[str, str], Dict[tuple, List[tuple]]] = {}
+    t_max_by_work_dir: Dict[str, int] = {}
     for work_dir in work_dir_list:
-        pairs = _collect_pairs(work_dir, instances, output_file)
+        cfg_t_max = _load_alg_max_length(work_dir)
+        if cfg_t_max is None:
+            print(
+                f"[WARN] {work_dir}: missing/invalid alg_config.json max_length; "
+                f"fallback T_max={max_length}"
+            )
+            cfg_t_max = max_length
+        elif cfg_t_max > max_length:
+            print(
+                f"[WARN] {work_dir}: alg_config max_length={cfg_t_max} > --T={max_length}; "
+                "nonminimality checks may be conservative."
+            )
+        t_max_by_work_dir[work_dir] = cfg_t_max
+
+    for work_dir in work_dir_list:
+        pairs, original_keys_by_inst, strict_subset_keys_by_original_by_inst = _collect_pairs(
+            work_dir,
+            instances,
+            output_file,
+            check_subset,
+        )
         for inst, ctrl in pairs:
             wdi = (work_dir, inst)
             wdi_ctrls.setdefault(wdi, []).append(ctrl)
+        for inst, keys in original_keys_by_inst.items():
+            wdi_original_keys[(work_dir, inst)] = keys
+        for inst, subset_map in strict_subset_keys_by_original_by_inst.items():
+            wdi_strict_subset_keys_by_original[(work_dir, inst)] = subset_map
 
     total = sum(len(ctrl_list) for ctrl_list in wdi_ctrls.values())
     if total == 0:
@@ -406,7 +602,8 @@ def verify_all(
     n_wds = len({work_dir for work_dir, _ in wdi_ctrls})
     print(
         f"Total: {total} bounded checks ({n_cached} cached, {n_to_compute} to compute) "
-        f"across {n_wds} experiment(s), {workers} subproblem workers [T={max_length}]"
+        f"across {n_wds} experiment(s), {workers} subproblem workers [T={max_length}], "
+        f"check_subset={check_subset}"
     )
 
     # Process by fixed instance first, then iterate experiments sequentially.
@@ -436,22 +633,60 @@ def verify_all(
                 total_for_wdi = len(ctrl_list)
                 completed_for_wdi = 0
                 last_pct = 0
+                wdi = (work_dir, inst)
+                original_keys = wdi_original_keys.get(wdi, set())
+                t_max = t_max_by_work_dir.get(work_dir, max_length)
+                original_valid_by_key: Dict[tuple, bool] = {}
 
                 for ctrl in ctrl_list:
-                    key = (inst, _ctrl_key(ctrl), max_length)
+                    ctrl_k = _ctrl_key(ctrl)
+                    key = (inst, ctrl_k, max_length)
                     if key in _result_cache:
-                        min_viol_len = _result_cache[key]
+                        min_viol_len, min_attr_len = _result_cache[key]
                     else:
-                        min_viol_len = _find_min_viol_len_for_inst(
+                        min_viol_len, min_attr_len = _find_min_lens_for_inst(
                             inst,
                             ctrl,
                             length_shards,
                             worker_pools,
                         )
-                        _result_cache[key] = min_viol_len
-                        update_checker_json(cache_path, inst, ctrl, min_viol_len)
+                        _result_cache[key] = (min_viol_len, min_attr_len)
+                        update_checker_json(
+                            cache_path,
+                            inst,
+                            ctrl,
+                            min_viol_len,
+                            min_attr_len,
+                        )
 
-                    _log_result(output_file, work_dir, inst, ctrl, min_viol_len)
+                    if ctrl_k in original_keys:
+                        _log_result(
+                            output_file,
+                            work_dir,
+                            inst,
+                            ctrl,
+                            min_viol_len,
+                            min_attr_len,
+                        )
+                        is_valid = _is_valid_control(min_viol_len, min_attr_len, t_max)
+                        original_valid_by_key[ctrl_k] = is_valid
+                        if not is_valid:
+                            tag = os.path.basename(work_dir)
+                            print(
+                                f"\tincorrect [{tag}/{inst}] {ctrl} "
+                                f"(T_max={t_max}, min_viol={min_viol_len}, min_attr={min_attr_len})"
+                            )
+                            _log_error(
+                                output_file=output_file,
+                                work_dir=work_dir,
+                                inst=inst,
+                                ctrl=ctrl,
+                                err_type="INCORRECT",
+                                detail=(
+                                    f"T_MAX,{t_max},MIN_ATTR_LEN_VIOL,{min_viol_len},"
+                                    f"MIN_ATTR_LEN,{min_attr_len}"
+                                ),
+                            )
 
                     completed_for_wdi += 1
                     pct = completed_for_wdi * 100 // total_for_wdi
@@ -463,6 +698,48 @@ def verify_all(
                             f"({completed_for_wdi}/{total_for_wdi})"
                         )
                         last_pct = milestone
+
+                if check_subset:
+                    subset_map = wdi_strict_subset_keys_by_original.get(wdi, {})
+                    for orig_key, subset_keys in subset_map.items():
+                        # Only valid controls can be non-minimal under the new definition.
+                        if not original_valid_by_key.get(orig_key, False):
+                            continue
+                        witness_key = None
+                        witness_pair: Optional[Tuple[int, int]] = None
+                        for sk in subset_keys:
+                            pair = _result_cache.get((inst, sk, max_length))
+                            if pair is None:
+                                continue
+                            sub_min_viol, sub_min_attr = pair
+                            if _is_valid_control(sub_min_viol, sub_min_attr, t_max):
+                                witness_key = sk
+                                witness_pair = pair
+                                break
+                        if witness_key is None:
+                            continue
+                        orig_ctrl = Control(dict(orig_key))
+                        witness_ctrl = Control(dict(witness_key))
+                        witness_min_viol, witness_min_attr = witness_pair  # type: ignore[misc]
+                        tag = os.path.basename(work_dir)
+                        print(
+                            f"\tnonminimal [{tag}/{inst}] {orig_ctrl} "
+                            f"witness_subset={witness_ctrl} "
+                            f"(T_max={t_max}, "
+                            f"witness_min_viol={witness_min_viol}, witness_min_attr={witness_min_attr})"
+                        )
+                        _log_error(
+                            output_file=output_file,
+                            work_dir=work_dir,
+                            inst=inst,
+                            ctrl=orig_ctrl,
+                            err_type="NONMINIMAL",
+                            detail=(
+                                f"WITNESS_SUBSET,{witness_ctrl},T_MAX,{t_max},"
+                                f"WITNESS_MIN_ATTR_LEN_VIOL,{witness_min_viol},"
+                                f"WITNESS_MIN_ATTR_LEN,{witness_min_attr}"
+                            ),
+                        )
 
                 _log_instance_done(output_file, work_dir, inst)
         finally:
@@ -480,8 +757,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
             "Verify controls from sol.json in parallel using bounded LLP checks: "
-            "for each control, report the minimum attractor length in [1..T] that violates "
-            "the phenotype, or -1 if none exists."
+            "for each control, compute min violating attractor length and min attractor length "
+            "in [1..T] (or -1 if none exists within T), then classify INCORRECT/NONMINIMAL."
         )
     )
     group = ap.add_mutually_exclusive_group(required=True)
@@ -549,6 +826,14 @@ if __name__ == "__main__":
             "(default: off; only JSON cache is used)."
         ),
     )
+    ap.add_argument(
+        "--check-subset",
+        action="store_true",
+        help=(
+            "If set, expand each control to all subsets (2^k per control of size k) "
+            "and verify/cache those subsets as well."
+        ),
+    )
     args = ap.parse_args()
 
     if args.T < 1:
@@ -581,7 +866,7 @@ if __name__ == "__main__":
     with open(output_path, "a", encoding="utf-8") as _f:
         _f.write(
             f"# [{_timestamp}] work_dirs=[{_dirs_str}] instances=[{_insts_str}] "
-            f"workers={args.workers} T={args.T}\n"
+            f"workers={args.workers} T={args.T} check_subset={args.check_subset}\n"
         )
 
     if args.work_dirs:
@@ -607,6 +892,7 @@ if __name__ == "__main__":
         args.workers,
         args.T,
         cache_path,
+        args.check_subset,
     )
 
     try:
