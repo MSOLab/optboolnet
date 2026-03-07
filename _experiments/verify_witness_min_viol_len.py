@@ -35,6 +35,16 @@ def _parse_t_from_cache_path(path: str) -> Optional[int]:
     return None
 
 
+def _is_valid_for_max_length(min_viol_len: int, max_length: int) -> bool:
+    return min_viol_len == -1 or min_viol_len > max_length
+
+
+def _is_strict_subset(sub: Dict[str, int], sup: Dict[str, int]) -> bool:
+    if len(sub) >= len(sup):
+        return False
+    return all(sup.get(k, None) == v for k, v in sub.items())
+
+
 class SequentialBoundedVerifier:
     def __init__(self, T: int) -> None:
         self.T = T
@@ -150,6 +160,10 @@ def main() -> None:
     mismatches: List[Dict[str, object]] = []
     missing_expected: List[Dict[str, object]] = []
     inconsistent_expected: List[Dict[str, object]] = []
+    entries_over_horizon: List[Dict[str, object]] = []
+    witness_inconsistent_with_max_length: List[Dict[str, object]] = []
+    witness_not_in_minimal_set: List[Dict[str, object]] = []
+    witness_not_strict_subset_of_control: List[Dict[str, object]] = []
 
     done = 0
     for key, meta in unique.items():
@@ -193,10 +207,108 @@ def main() -> None:
         if done % 10 == 0 or done == n_unique:
             print(f"  progress: {done}/{n_unique}")
 
+    # Per-entry consistency with max_length
+    for idx, e in enumerate(entries):
+        inst = str(e.get("instance"))
+        witness = e.get("witness_minimal")
+        control = e.get("control")
+        max_control_size_raw = e.get("max_control_size")
+        max_length_raw = e.get("max_length")
+        if not isinstance(witness, dict):
+            continue
+        if not isinstance(control, dict):
+            continue
+        try:
+            max_control_size = int(max_control_size_raw)
+        except (TypeError, ValueError):
+            max_control_size = None
+        max_length = _normalize_len(max_length_raw)
+        if max_length is None or max_length < 1:
+            continue
+
+        witness_norm = {str(k): int(v) for k, v in witness.items()}
+        control_norm = {str(k): int(v) for k, v in control.items()}
+
+        if not _is_strict_subset(witness_norm, control_norm):
+            witness_not_strict_subset_of_control.append(
+                {
+                    "entry_index": idx,
+                    "instance": inst,
+                    "control": dict(sorted(control_norm.items())),
+                    "witness_minimal": dict(sorted(witness_norm.items())),
+                }
+            )
+
+        # Verify witness belongs to minimal_controls_by_setting from input JSON.
+        # New key format: "{inst}|{max_control_size}|{max_length}".
+        # Backward-compatible fallback: "{inst}|{max_control_size}".
+        setting_key_new = (
+            f"{inst}|{max_control_size}|{max_length}"
+            if max_control_size is not None
+            else None
+        )
+        setting_key_old = (
+            f"{inst}|{max_control_size}" if max_control_size is not None else None
+        )
+        minimal_setting = []
+        if setting_key_new and setting_key_new in data.get("minimal_controls_by_setting", {}):
+            minimal_setting = data["minimal_controls_by_setting"][setting_key_new]
+        elif setting_key_old and setting_key_old in data.get("minimal_controls_by_setting", {}):
+            minimal_setting = data["minimal_controls_by_setting"][setting_key_old]
+        minimal_keys = {
+            _ctrl_key({str(k): int(v) for k, v in c.items()})
+            for c in minimal_setting
+            if isinstance(c, dict)
+        }
+        if _ctrl_key(witness_norm) not in minimal_keys:
+            witness_not_in_minimal_set.append(
+                {
+                    "entry_index": idx,
+                    "instance": inst,
+                    "max_control_size": max_control_size,
+                    "max_length": max_length,
+                    "witness_minimal": dict(sorted(witness_norm.items())),
+                    "setting_key_checked": setting_key_new or setting_key_old,
+                }
+            )
+
+        if max_length > T:
+            entries_over_horizon.append(
+                {
+                    "entry_index": idx,
+                    "instance": inst,
+                    "max_length": max_length,
+                    "T": T,
+                }
+            )
+            continue
+        solved_key = (inst, _ctrl_key(witness))
+        computed = solved.get(solved_key)
+        if computed is None:
+            continue
+        if not _is_valid_for_max_length(computed, max_length):
+            witness_inconsistent_with_max_length.append(
+                {
+                    "entry_index": idx,
+                    "instance": inst,
+                    "max_length": max_length,
+                    "witness_minimal": dict(sorted((str(k), int(v)) for k, v in witness.items())),
+                    "computed_witness_min_viol_len": computed,
+                    "expected_valid_condition": "min_viol_len == -1 or min_viol_len > max_length",
+                }
+            )
+
     all_correct = (
         len(mismatches) == 0
         and len(missing_expected) == 0
         and len(inconsistent_expected) == 0
+    )
+    max_length_consistent = (
+        len(witness_inconsistent_with_max_length) == 0 and len(entries_over_horizon) == 0
+    )
+    witness_correct = (
+        len(witness_not_in_minimal_set) == 0
+        and len(witness_not_strict_subset_of_control) == 0
     )
 
     report = {
@@ -211,10 +323,22 @@ def main() -> None:
             "missing_expected_count": len(missing_expected),
             "inconsistent_expected_count": len(inconsistent_expected),
             "all_witness_minimal_min_viol_len_correct": all_correct,
+            "entries_over_horizon_count": len(entries_over_horizon),
+            "witness_inconsistent_with_max_length_count": len(
+                witness_inconsistent_with_max_length
+            ),
+            "all_witness_consistent_with_max_length": max_length_consistent,
+            "witness_not_in_minimal_set_count": len(witness_not_in_minimal_set),
+            "witness_not_strict_subset_count": len(witness_not_strict_subset_of_control),
+            "all_witness_correct": witness_correct,
         },
         "mismatches": mismatches,
         "missing_expected": missing_expected,
         "inconsistent_expected": inconsistent_expected,
+        "entries_over_horizon": entries_over_horizon,
+        "witness_inconsistent_with_max_length": witness_inconsistent_with_max_length,
+        "witness_not_in_minimal_set": witness_not_in_minimal_set,
+        "witness_not_strict_subset_of_control": witness_not_strict_subset_of_control,
     }
 
     if args.output is None:
@@ -230,7 +354,13 @@ def main() -> None:
         "Done. "
         f"all_correct={all_correct}, mismatches={len(mismatches)}, "
         f"missing_expected={len(missing_expected)}, "
-        f"inconsistent_expected={len(inconsistent_expected)}"
+        f"inconsistent_expected={len(inconsistent_expected)}, "
+        f"max_length_consistent={max_length_consistent}, "
+        f"over_horizon={len(entries_over_horizon)}, "
+        f"horizon_invalid={len(witness_inconsistent_with_max_length)}, "
+        f"witness_correct={witness_correct}, "
+        f"witness_not_in_set={len(witness_not_in_minimal_set)}, "
+        f"witness_not_subset={len(witness_not_strict_subset_of_control)}"
     )
     print(f"Report: {out_path}")
 

@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 from optboolnet.instances import _INSTANCE_LIST_FULL
@@ -104,28 +105,55 @@ def _load_max_control_size(work_dir: str) -> Optional[int]:
         return None
 
 
+def _load_max_length(work_dir: str) -> Optional[int]:
+    config_path = os.path.join(work_dir, "alg_config.json")
+    if not os.path.exists(config_path):
+        return None
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    try:
+        return int(cfg["max_length"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _parse_cache_horizon(path: str) -> Optional[int]:
+    m = re.search(r"_T(\d+)\.json$", path)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _is_valid_for_max_length(min_viol_len: int, max_length: int) -> bool:
+    # min_viol_len is first violating attractor length.
+    # Valid up to max_length iff no violation exists in [1..max_length].
+    return min_viol_len == -1 or min_viol_len > max_length
+
+
 def _build_minimal_controls_by_setting(
     cache_data: Dict[str, Dict[str, int]],
-    settings: List[Tuple[str, int]],
+    settings: List[Tuple[str, int, int]],
 ) -> Tuple[
-    Dict[Tuple[str, int], List[Dict[str, int]]],
-    Dict[Tuple[str, int], Dict[Tuple[Tuple[str, int], ...], int]],
+    Dict[Tuple[str, int, int], List[Dict[str, int]]],
+    Dict[Tuple[str, int, int], Dict[Tuple[Tuple[str, int], ...], int]],
 ]:
-    unique_settings = sorted(set(settings), key=lambda x: (x[0], x[1]))
-    out: Dict[Tuple[str, int], List[Dict[str, int]]] = {}
-    out_len_by_key: Dict[Tuple[str, int], Dict[Tuple[Tuple[str, int], ...], int]] = {}
-    for inst, max_control_size in unique_settings:
+    unique_settings = sorted(set(settings), key=lambda x: (x[0], x[1], x[2]))
+    out: Dict[Tuple[str, int, int], List[Dict[str, int]]] = {}
+    out_len_by_key: Dict[
+        Tuple[str, int, int], Dict[Tuple[Tuple[str, int], ...], int]
+    ] = {}
+    for inst, max_control_size, max_length in unique_settings:
         candidates: List[Dict[str, int]] = []
         candidate_len_by_key: Dict[Tuple[Tuple[str, int], ...], int] = {}
         for jk, min_viol_len in cache_data.get(inst, {}).items():
-            if min_viol_len == -1 or min_viol_len >= max_control_size:
+            if _is_valid_for_max_length(min_viol_len, max_length):
                 ctrl = _parse_ctrl_json_key(jk)
                 if ctrl is not None:
                     candidates.append(ctrl)
                     candidate_len_by_key[_ctrl_key(ctrl)] = int(min_viol_len)
         minimal_ctrls = _drop_nonminimal(candidates)
-        out[(inst, max_control_size)] = minimal_ctrls
-        out_len_by_key[(inst, max_control_size)] = {
+        out[(inst, max_control_size, max_length)] = minimal_ctrls
+        out_len_by_key[(inst, max_control_size, max_length)] = {
             _ctrl_key(ctrl): candidate_len_by_key[_ctrl_key(ctrl)]
             for ctrl in minimal_ctrls
             if _ctrl_key(ctrl) in candidate_len_by_key
@@ -207,17 +235,25 @@ def main() -> None:
             print(f"  {d}")
 
     cache_data = _load_bounded_cache(args.json_cache)
+    cache_horizon = _parse_cache_horizon(args.json_cache)
 
     max_control_size_by_work_dir: Dict[str, Optional[int]] = {
         wd: _load_max_control_size(wd) for wd in work_dir_list
     }
-    settings: List[Tuple[str, int]] = []
+    max_length_by_work_dir: Dict[str, Optional[int]] = {
+        wd: _load_max_length(wd) for wd in work_dir_list
+    }
+    settings: List[Tuple[str, int, int]] = []
     for wd in work_dir_list:
         mcs = max_control_size_by_work_dir[wd]
-        if mcs is None:
+        ml = max_length_by_work_dir[wd]
+        if mcs is None or ml is None:
+            continue
+        if cache_horizon is not None and ml > cache_horizon:
+            # Cache cannot certify beyond its bounded horizon.
             continue
         for inst in args.instances:
-            settings.append((inst, mcs))
+            settings.append((inst, mcs, ml))
 
     minimal_by_setting, minimal_len_by_setting = _build_minimal_controls_by_setting(
         cache_data,
@@ -227,14 +263,27 @@ def main() -> None:
     non_minimal_entries: List[Dict[str, object]] = []
     missing_sol: List[Dict[str, str]] = []
     missing_max_control_size: List[str] = []
+    missing_max_length: List[str] = []
+    skipped_by_cache_horizon: List[str] = []
     total_controls_scanned = 0
 
     for work_dir in work_dir_list:
         experiment = os.path.basename(os.path.normpath(work_dir))
         max_control_size = max_control_size_by_work_dir.get(work_dir)
+        max_length = max_length_by_work_dir.get(work_dir)
         if max_control_size is None:
             print(f"[skip] {experiment}: missing/invalid max_control_size in alg_config.json")
             missing_max_control_size.append(work_dir)
+            continue
+        if max_length is None:
+            print(f"[skip] {experiment}: missing/invalid max_length in alg_config.json")
+            missing_max_length.append(work_dir)
+            continue
+        if cache_horizon is not None and max_length > cache_horizon:
+            print(
+                f"[skip] {experiment}: max_length={max_length} exceeds cache horizon T={cache_horizon}"
+            )
+            skipped_by_cache_horizon.append(work_dir)
             continue
 
         for inst in args.instances:
@@ -245,8 +294,9 @@ def main() -> None:
 
             ctrls = _load_controls_from_sol(sol_path)
             total_controls_scanned += len(ctrls)
-            minimal_set = minimal_by_setting.get((inst, max_control_size), [])
-            minimal_len_map = minimal_len_by_setting.get((inst, max_control_size), {})
+            setting = (inst, max_control_size, max_length)
+            minimal_set = minimal_by_setting.get(setting, [])
+            minimal_len_map = minimal_len_by_setting.get(setting, {})
 
             # Fast key set for exact-minimal controls.
             minimal_keys = {_ctrl_key(c) for c in minimal_set}
@@ -264,6 +314,7 @@ def main() -> None:
                         "experiment": experiment,
                         "instance": inst,
                         "max_control_size": max_control_size,
+                        "max_length": max_length,
                         "control": dict(sorted(ctrl.items())),
                         "witness_minimal": dict(sorted(witness.items())),
                         "witness_minimal_min_viol_len": minimal_len_map.get(witness_key),
@@ -280,13 +331,18 @@ def main() -> None:
     )
 
     minimal_controls_json = {
-        f"{inst}|{mcs}": [dict(sorted(c.items())) for c in minimal_by_setting[(inst, mcs)]]
-        for inst, mcs in sorted(minimal_by_setting.keys(), key=lambda x: (x[0], x[1]))
+        f"{inst}|{mcs}|{ml}": [
+            dict(sorted(c.items())) for c in minimal_by_setting[(inst, mcs, ml)]
+        ]
+        for inst, mcs, ml in sorted(
+            minimal_by_setting.keys(), key=lambda x: (x[0], x[1], x[2])
+        )
     }
 
     output_obj = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "json_cache": args.json_cache,
+        "cache_horizon_T": cache_horizon,
         "work_dirs": work_dir_list,
         "instances": args.instances,
         "summary": {
@@ -295,11 +351,15 @@ def main() -> None:
             "non_minimal_found": len(non_minimal_entries),
             "missing_sol_count": len(missing_sol),
             "missing_max_control_size_count": len(missing_max_control_size),
+            "missing_max_length_count": len(missing_max_length),
+            "skipped_by_cache_horizon_count": len(skipped_by_cache_horizon),
         },
         "minimal_controls_by_setting": minimal_controls_json,
         "non_minimal_controls": non_minimal_entries,
         "missing_sol": missing_sol,
         "missing_max_control_size": missing_max_control_size,
+        "missing_max_length": missing_max_length,
+        "skipped_by_cache_horizon": skipped_by_cache_horizon,
     }
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
