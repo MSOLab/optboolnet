@@ -38,6 +38,7 @@ from analysis import Experiment, _METRICS, inst_list
 
 INST_ORDER = ["S1", "S2", "S3", "S4", "M1", "M2", "M3", "L1", "L2", "L3", "L4"]
 LABEL_MAP: dict[str, str] = {}
+KNOWN_ALG_SUBDIRS = ("benders", "MibS", "pbn")
 _CUT_LABEL_MAP: dict[str, str] = {
     "ATTRACTOR_CUT": "AT cut",
     "TRAP_SPACE_CUT": "TS cut",
@@ -60,6 +61,14 @@ def _find_alg_subdir(exp_dir: str) -> str | None:
         entries = [e for e in os.scandir(exp_dir) if e.is_dir()]
     except PermissionError:
         return None
+
+    # Prefer known algorithm folder names when present.
+    entry_map = {entry.name.lower(): entry.name for entry in entries}
+    for alg_name in KNOWN_ALG_SUBDIRS:
+        actual_name = entry_map.get(alg_name.lower())
+        if actual_name is not None:
+            return actual_name
+
     for entry in entries:
         try:
             child_names = {c.name for c in os.scandir(entry.path) if c.is_dir()}
