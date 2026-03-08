@@ -554,7 +554,12 @@ def verify_all(
     max_length: int,
     cache_path: str,
     check_subset: bool,
-) -> None:
+) -> Dict[str, Dict[str, int]]:
+    err_counts_by_exp: Dict[str, Dict[str, int]] = {}
+    for work_dir in work_dir_list:
+        exp = os.path.basename(os.path.normpath(work_dir))
+        err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+
     wdi_ctrls: Dict[Tuple[str, str], List[Control]] = {}
     wdi_original_keys: Dict[Tuple[str, str], set] = {}
     wdi_strict_subset_keys_by_original: Dict[Tuple[str, str], Dict[tuple, List[tuple]]] = {}
@@ -591,7 +596,7 @@ def verify_all(
 
     total = sum(len(ctrl_list) for ctrl_list in wdi_ctrls.values())
     if total == 0:
-        return
+        return err_counts_by_exp
 
     n_to_compute = 0
     for (_, inst), ctrl_list in wdi_ctrls.items():
@@ -672,6 +677,9 @@ def verify_all(
                         original_valid_by_key[ctrl_k] = is_valid
                         if not is_valid:
                             tag = os.path.basename(work_dir)
+                            exp = os.path.basename(os.path.normpath(work_dir))
+                            err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+                            err_counts_by_exp[exp]["incorrect"] += 1
                             print(
                                 f"\tincorrect [{tag}/{inst}] {ctrl} "
                                 f"(T_max={t_max}, min_viol={min_viol_len}, min_attr={min_attr_len})"
@@ -718,6 +726,9 @@ def verify_all(
                                 break
                         if witness_key is None:
                             continue
+                        exp = os.path.basename(os.path.normpath(work_dir))
+                        err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+                        err_counts_by_exp[exp]["nonminimal"] += 1
                         orig_ctrl = Control(dict(orig_key))
                         witness_ctrl = Control(dict(witness_key))
                         witness_min_viol, witness_min_attr = witness_pair  # type: ignore[misc]
@@ -747,6 +758,8 @@ def verify_all(
                 pool.close()
             for pool in worker_pools:
                 pool.join()
+
+    return err_counts_by_exp
 
 
 # ---------------------------------------------------------------------------
@@ -871,8 +884,14 @@ if __name__ == "__main__":
 
     if args.work_dirs:
         work_dir_list = args.work_dirs
+        parent_dirs = [
+            os.path.abspath(os.path.dirname(os.path.normpath(wd)))
+            for wd in work_dir_list
+        ]
+        results_root = os.path.commonpath(parent_dirs) if parent_dirs else "."
     else:
         root_dir = args.root_dir
+        results_root = root_dir
         work_dir_list = [
             os.path.join(root_dir, sub)
             for sub in sorted(os.listdir(root_dir))
@@ -885,7 +904,7 @@ if __name__ == "__main__":
         for d in work_dir_list:
             print(f"  {d}")
 
-    verify_all(
+    err_counts_by_exp = verify_all(
         work_dir_list,
         output_path,
         args.instances,
@@ -894,6 +913,29 @@ if __name__ == "__main__":
         cache_path,
         args.check_subset,
     )
+
+    verify_summary_path = os.path.join(results_root, "_results", f"verify_control_T{args.T}.json")
+    os.makedirs(os.path.dirname(verify_summary_path), exist_ok=True)
+    sorted_counts = {
+        exp: err_counts_by_exp[exp]
+        for exp in sorted(err_counts_by_exp.keys())
+    }
+    summary_obj = {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "root_dir": results_root,
+        "T": args.T,
+        "check_subset": args.check_subset,
+        "instances": args.instances,
+        "experiments": sorted_counts,
+        "summary": {
+            "experiments": len(sorted_counts),
+            "incorrect_total": sum(v["incorrect"] for v in sorted_counts.values()),
+            "nonminimal_total": sum(v["nonminimal"] for v in sorted_counts.values()),
+        },
+    }
+    with open(verify_summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_obj, f, indent=2)
+    print(f"Wrote verify summary: {verify_summary_path}")
 
     try:
         _flush_checker_json(cache_path, _checker_data)

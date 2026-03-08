@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
@@ -102,11 +103,42 @@ def _json_key_to_cache_key(inst: str, json_key: str) -> tuple:
 
 
 def _flush_checker_json(json_path: str, data: Dict[str, Dict[str, object]]) -> None:
-    """Atomically overwrite json_path from provided cache data."""
-    tmp = json_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, json_path)
+    """Best-effort atomic overwrite; warn on failure and keep running."""
+    tmp = f"{json_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as exc:
+        print(f"[WARN] cache tmp write failed: {tmp} ({exc})")
+        return
+
+    delays = [0.05, 0.1, 0.2, 0.5, 1.0]
+    last_err: Optional[OSError] = None
+    for delay in delays:
+        try:
+            os.replace(tmp, json_path)
+            return
+        except OSError as exc:
+            last_err = exc
+            time.sleep(delay)
+
+    print(
+        f"[WARN] cache replace failed; skipping flush for now: {json_path} "
+        f"(tmp={tmp}, err={last_err})"
+    )
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _safe_flush_checker_json(json_path: str, data: Dict[str, Dict[str, object]]) -> None:
+    """Never raise from cache flush; emit warning and continue."""
+    try:
+        _flush_checker_json(json_path, data)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        print(f"[WARN] cache flush crashed; skipping write: {json_path} ({exc})")
 
 
 def _merge_cache_into_result_cache(data: Dict[str, Dict[str, object]], ok_value: bool) -> int:
@@ -215,13 +247,13 @@ def load_checker_jsons(
                             _checker_positive_data.get(inst, {}).pop(jk, None)
                             migrated += 1
             if migrated > 0 or pos_normalized or neg_normalized:
-                _flush_checker_json(positive_path, _checker_positive_data)
-                _flush_checker_json(negative_path, _checker_negative_data)
+                _safe_flush_checker_json(positive_path, _checker_positive_data)
+                _safe_flush_checker_json(negative_path, _checker_negative_data)
     elif pos_normalized or neg_normalized:
         if pos_normalized:
-            _flush_checker_json(positive_path, _checker_positive_data)
+            _safe_flush_checker_json(positive_path, _checker_positive_data)
         if neg_normalized:
-            _flush_checker_json(negative_path, _checker_negative_data)
+            _safe_flush_checker_json(negative_path, _checker_negative_data)
 
     pos_count = _merge_cache_into_result_cache(_checker_positive_data, True)
     neg_count = _merge_cache_into_result_cache(_checker_negative_data, False)
@@ -243,9 +275,9 @@ def update_checker_jsons(
             removed = jk in _checker_negative_data.get(inst, {})
             _checker_positive_data.setdefault(inst, {})[jk] = True
             _checker_negative_data.get(inst, {}).pop(jk, None)
-            _flush_checker_json(positive_path, _checker_positive_data)
+            _safe_flush_checker_json(positive_path, _checker_positive_data)
             if removed:
-                _flush_checker_json(negative_path, _checker_negative_data)
+                _safe_flush_checker_json(negative_path, _checker_negative_data)
         else:
             neg_len = _normalize_negative_len(counterexample_len)
             existing = _checker_negative_data.get(inst, {}).get(jk)
@@ -254,9 +286,9 @@ def update_checker_jsons(
                 _checker_negative_data.setdefault(inst, {})[jk] = neg_len
             removed = jk in _checker_positive_data.get(inst, {})
             _checker_positive_data.get(inst, {}).pop(jk, None)
-            _flush_checker_json(negative_path, _checker_negative_data)
+            _safe_flush_checker_json(negative_path, _checker_negative_data)
             if removed:
-                _flush_checker_json(positive_path, _checker_positive_data)
+                _safe_flush_checker_json(positive_path, _checker_positive_data)
 
 
 def extract_from_log(log_path: str, positive_path: str, negative_path: str) -> int:
@@ -322,8 +354,8 @@ def extract_from_log(log_path: str, positive_path: str, negative_path: str) -> i
                     changed = True
                 _result_cache[_json_key_to_cache_key(inst, jk)] = False
     if changed:
-        _flush_checker_json(positive_path, _checker_positive_data)
-        _flush_checker_json(negative_path, _checker_negative_data)
+        _safe_flush_checker_json(positive_path, _checker_positive_data)
+        _safe_flush_checker_json(negative_path, _checker_negative_data)
     return count
 
 
@@ -411,11 +443,10 @@ def verify_all(
     logic: str = "ctl",
 ) -> List[Tuple[str, str, Control]]:
     """
-    Verify controls from all work_dirs using a single shared worker pool.
+    Verify controls from all work_dirs using a shared worker pool.
 
-    All (work_dir, inst, ctrl) triplets from every experiment are submitted at
-    once so workers are never idle waiting for one slow experiment to finish
-    before the next starts.
+    Controls are processed instance-by-instance across experiments to maximize
+    worker-side reuse for the same instance before moving to the next one.
 
     Returns a list of (work_dir, inst, ctrl) for every control that failed
     the phenotype check — pass these to get_loop_lengths() for LTL analysis.
@@ -475,11 +506,26 @@ def verify_all(
     if not to_run:
         return incorrect
 
-    # Phase 3: single pool for all non-cached triplets across all experiments.
+    # Phase 3: run non-cached triplets grouped by instance.
+    inst_to_run: Dict[str, List[Tuple[str, str, Control, tuple]]] = {}
+    for triplet in to_run:
+        _, inst, _, _ = triplet
+        inst_to_run.setdefault(inst, []).append(triplet)
+
     wdi_completed: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
     last_pct_by_wdi: Dict[Tuple[str, str], int] = {wdi: 0 for wdi in wdi_to_run_count}
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    def _process_inst_triplets(
+        executor: ProcessPoolExecutor,
+        inst: str,
+        inst_triplets: List[Tuple[str, str, Control, tuple]],
+    ) -> None:
+        if not inst_triplets:
+            return
+        print(
+            f"[{inst}] processing {len(inst_triplets)} control(s) "
+            f"across {len({wd for wd, _, _, _ in inst_triplets})} experiment(s)"
+        )
         if logic == "ltl":
             futures = {
                 executor.submit(_check_ctrl_ltl_for_inst, inst, ctrl): (
@@ -488,12 +534,17 @@ def verify_all(
                     ctrl,
                     key,
                 )
-                for work_dir, inst, ctrl, key in to_run
+                for work_dir, inst, ctrl, key in inst_triplets
             }
         else:
             futures = {
-                executor.submit(_check_ctrl_for_inst, inst, ctrl): (work_dir, inst, ctrl, key)
-                for work_dir, inst, ctrl, key in to_run
+                executor.submit(_check_ctrl_for_inst, inst, ctrl): (
+                    work_dir,
+                    inst,
+                    ctrl,
+                    key,
+                )
+                for work_dir, inst, ctrl, key in inst_triplets
             }
         for future in as_completed(futures):
             work_dir, inst, ctrl, key = futures[future]
@@ -538,6 +589,16 @@ def verify_all(
 
             if c == n:
                 _log_instance_done(output_file, work_dir, inst)
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        instance_set = set(instances)
+        for inst in instances:
+            _process_inst_triplets(executor, inst, inst_to_run.get(inst, []))
+
+        # Handle any instances not listed in --instances but present in collected data.
+        remaining_insts = sorted(inst for inst in inst_to_run.keys() if inst not in instance_set)
+        for inst in remaining_insts:
+            _process_inst_triplets(executor, inst, inst_to_run[inst])
 
     return incorrect
 
@@ -618,6 +679,15 @@ if __name__ == "__main__":
         help="Output file to write results to (default: _experiments/verify_control_log.txt)",
     )
     ap.add_argument(
+        "--summary-output",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Output JSON path for summary report "
+            "(default: {root_dir}/_results/verify_control_Tinf.json)."
+        ),
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=os.cpu_count(),
@@ -688,8 +758,14 @@ if __name__ == "__main__":
 
     if args.work_dirs:
         work_dir_list = args.work_dirs
+        parent_dirs = [
+            os.path.abspath(os.path.dirname(os.path.normpath(wd)))
+            for wd in work_dir_list
+        ]
+        results_root = os.path.commonpath(parent_dirs) if parent_dirs else "."
     else:
         root_dir = args.root_dir
+        results_root = root_dir
         work_dir_list = [
             os.path.join(root_dir, sub)
             for sub in sorted(os.listdir(root_dir))
@@ -711,6 +787,42 @@ if __name__ == "__main__":
         args.json_negative,
         logic=args.logic,
     )
+
+    err_counts_by_exp: Dict[str, Dict[str, int]] = {}
+    for work_dir in work_dir_list:
+        exp = os.path.basename(os.path.normpath(work_dir))
+        err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+    for work_dir, _, _ in all_incorrect:
+        exp = os.path.basename(os.path.normpath(work_dir))
+        err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+        err_counts_by_exp[exp]["incorrect"] += 1
+
+    verify_summary_path = (
+        args.summary_output
+        if args.summary_output is not None
+        else os.path.join(results_root, "_results", "verify_control_Tinf.json")
+    )
+    os.makedirs(os.path.dirname(verify_summary_path), exist_ok=True)
+    sorted_counts = {
+        exp: err_counts_by_exp[exp]
+        for exp in sorted(err_counts_by_exp.keys())
+    }
+    summary_obj = {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "root_dir": results_root,
+        "T": "infinite",
+        "logic": args.logic,
+        "instances": args.instances,
+        "experiments": sorted_counts,
+        "summary": {
+            "experiments": len(sorted_counts),
+            "incorrect_total": sum(v["incorrect"] for v in sorted_counts.values()),
+            "nonminimal_total": sum(v["nonminimal"] for v in sorted_counts.values()),
+        },
+    }
+    with open(verify_summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_obj, f, indent=2)
+    print(f"Wrote verify summary: {verify_summary_path}")
 
     # Call get_loop_lengths(all_incorrect, args.output, args.workers) here
     # to run LTL counterexample analysis on the incorrect controls.
