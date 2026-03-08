@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+from functools import lru_cache
 from itertools import combinations, product
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -55,6 +56,8 @@ _NUSMV_RESERVED_LOWER = frozenset(
     ]
 )
 
+_SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
 
 def _require_pyboolnet() -> None:
     if _PYBOOLNET_IMPORT_ERROR is not None:
@@ -97,19 +100,44 @@ def _to_nusmv_safe_name(name: str, used: set[str]) -> str:
     return candidate
 
 
+@lru_cache(maxsize=4096)
+def _cached_rename_mapping(
+    var_names: Tuple[str, ...]
+) -> Tuple[Tuple[Tuple[str, str], ...], bool]:
+    # Fast path: already safe, unique, and non-reserved.
+    seen = set()
+    safe_without_rename = True
+    for var in var_names:
+        if (
+            len(var) < 2
+            or (var.lower() in _NUSMV_RESERVED_LOWER)
+            or (_SAFE_NAME_PATTERN.fullmatch(var) is None)
+            or (var in seen)
+        ):
+            safe_without_rename = False
+            break
+        seen.add(var)
+    if safe_without_rename:
+        return tuple((var, var) for var in var_names), False
+
+    rename_map: Dict[str, str] = {}
+    used: set[str] = set()
+    requires_rename = False
+    for var in var_names:
+        safe = _to_nusmv_safe_name(var, used)
+        rename_map[var] = safe
+        if safe != var:
+            requires_rename = True
+    return tuple(rename_map.items()), requires_rename
+
+
 def _rename_primes_and_target_for_nusmv(
     primes: dict, target: List[Dict[str, int]]
 ) -> Tuple[dict, List[Dict[str, int]]]:
     # NuSMV used by PyBoolNet rejects 1-char variable names (e.g., "p").
     # Keep the original names everywhere else and only rename in model checking.
-    rename_map: Dict[str, str] = {}
-    used: set[str] = set()
-    requires_rename = False
-    for var in primes.keys():
-        safe = _to_nusmv_safe_name(var, used)
-        rename_map[var] = safe
-        if safe != var:
-            requires_rename = True
+    mapping_items, requires_rename = _cached_rename_mapping(tuple(primes.keys()))
+    rename_map = dict(mapping_items)
 
     if not requires_rename:
         return primes, target
@@ -171,8 +199,10 @@ def control_model_checking(
     target: List[Dict[str, int]],
     update: str,
     max_output_trapspaces: int,
+    perc: Optional[Dict[str, int]] = None,
 ) -> bool:
-    perc = find_constants(primes=percolate(primes=primes, add_constants=candidate, copy=True))
+    if perc is None:
+        perc = find_constants(primes=percolate(primes=primes, add_constants=candidate, copy=True))
     target_vars = list({item for subs in target for item in subs})
     new_primes = fix_components_and_reduce(primes, perc, keep_vars=target_vars)
     minimal_trap_spaces = compute_trap_spaces(new_primes, "min", max_output=max_output_trapspaces)
@@ -191,6 +221,14 @@ def control_completeness(
     if not all(is_included_in_subspace(ts, target) for ts in minimal_trap_spaces):
         return False
     return bool(completeness(new_primes, update))
+
+
+def _percolated_constants(primes: dict, candidate: Dict[str, int]) -> Dict[str, int]:
+    return find_constants(primes=percolate(primes=primes, add_constants=candidate, copy=True))
+
+
+def _direct_percolation_from_constants(perc: Dict[str, int], target: List[Dict[str, int]]) -> bool:
+    return any(is_included_in_subspace(perc, subs) for subs in target)
 
 
 def find_necessary_interventions(primes: dict, target: List[Dict[str, int]]) -> Dict[str, int]:
@@ -248,7 +286,7 @@ def compute_control_strategies_with_model_checking(
 
     perc_true_keys = set()
     for known in list_strategies:
-        perc = find_constants(primes=percolate(primes=primes, add_constants=known, copy=True))
+        perc = _percolated_constants(primes, known)
         perc_true_keys.add(_subspace_key(perc))
     perc_false_keys = set()
 
@@ -280,7 +318,7 @@ def compute_control_strategies_with_model_checking(
                 if any(is_included_in_subspace(candidate, x) for x in list_strategies):
                     continue
 
-                perc = find_constants(primes=percolate(primes=primes, add_constants=candidate, copy=True))
+                perc = _percolated_constants(primes, candidate)
                 perc_key = _subspace_key(perc)
                 check_st = time.time()
 
@@ -292,13 +330,13 @@ def compute_control_strategies_with_model_checking(
                 if perc_key in perc_false_keys:
                     continue
 
-                if control_direct_percolation(primes, candidate, target):
+                if _direct_percolation_from_constants(perc, target):
                     perc_true_keys.add(perc_key)
                     list_strategies.append(candidate)
                     if on_control_found is not None:
                         on_control_found(candidate, target_size, "PERCOLATION", time.time() - check_st)
                 elif control_model_checking(
-                    primes, candidate, target, update, max_output_trapspaces=max_output_trapspaces
+                    primes, candidate, target, update, max_output_trapspaces=max_output_trapspaces, perc=perc
                 ):
                     perc_true_keys.add(perc_key)
                     list_strategies.append(candidate)
