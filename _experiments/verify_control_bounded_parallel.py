@@ -888,6 +888,10 @@ if __name__ == "__main__":
         if n_from_log:
             print(f"Bootstrap-added {n_from_log} bounded result(s) from existing log")
 
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
     _insts_str = ", ".join(args.instances)

@@ -14,7 +14,7 @@ from optboolnet.checking import nusmv_check_phenotype, nusmv_check_phenotype_ful
 from optboolnet.instances import load_bn_in_repo, _INSTANCE_LIST_FULL
 
 
-_ALGO_SUBDIRS = ["benders", "MibS"]
+_ALGO_SUBDIRS = ["benders", "MibS", "pbn"]
 
 # ---------------------------------------------------------------------------
 # Per-worker state (each worker process has its own copy)
@@ -746,6 +746,10 @@ if __name__ == "__main__":
             f"Loaded {loaded_total} cached result(s): "
             f"{n_pos} positive, {n_neg} negative"
         )
+
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     _timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _dirs_str = ", ".join(args.work_dirs) if args.work_dirs else f"root={args.root_dir}"
