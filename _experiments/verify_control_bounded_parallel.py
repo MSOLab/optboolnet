@@ -554,11 +554,13 @@ def verify_all(
     max_length: int,
     cache_path: str,
     check_subset: bool,
-) -> Dict[str, Dict[str, int]]:
+) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, Dict[str, int]]]]:
     err_counts_by_exp: Dict[str, Dict[str, int]] = {}
+    err_counts_by_exp_inst: Dict[str, Dict[str, Dict[str, int]]] = {}
     for work_dir in work_dir_list:
         exp = os.path.basename(os.path.normpath(work_dir))
         err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+        err_counts_by_exp_inst.setdefault(exp, {})
 
     wdi_ctrls: Dict[Tuple[str, str], List[Control]] = {}
     wdi_original_keys: Dict[Tuple[str, str], set] = {}
@@ -596,7 +598,7 @@ def verify_all(
 
     total = sum(len(ctrl_list) for ctrl_list in wdi_ctrls.values())
     if total == 0:
-        return err_counts_by_exp
+        return err_counts_by_exp, err_counts_by_exp_inst
 
     n_to_compute = 0
     for (_, inst), ctrl_list in wdi_ctrls.items():
@@ -639,9 +641,14 @@ def verify_all(
                 completed_for_wdi = 0
                 last_pct = 0
                 wdi = (work_dir, inst)
+                exp = os.path.basename(os.path.normpath(work_dir))
                 original_keys = wdi_original_keys.get(wdi, set())
                 t_max = t_max_by_work_dir.get(work_dir, max_length)
                 original_valid_by_key: Dict[tuple, bool] = {}
+                err_counts_by_exp_inst.setdefault(exp, {}).setdefault(
+                    inst,
+                    {"incorrect": 0, "nonminimal": 0},
+                )
 
                 for ctrl in ctrl_list:
                     ctrl_k = _ctrl_key(ctrl)
@@ -677,9 +684,13 @@ def verify_all(
                         original_valid_by_key[ctrl_k] = is_valid
                         if not is_valid:
                             tag = os.path.basename(work_dir)
-                            exp = os.path.basename(os.path.normpath(work_dir))
                             err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
                             err_counts_by_exp[exp]["incorrect"] += 1
+                            err_counts_by_exp_inst.setdefault(exp, {}).setdefault(
+                                inst,
+                                {"incorrect": 0, "nonminimal": 0},
+                            )
+                            err_counts_by_exp_inst[exp][inst]["incorrect"] += 1
                             print(
                                 f"\tincorrect [{tag}/{inst}] {ctrl} "
                                 f"(T_max={t_max}, min_viol={min_viol_len}, min_attr={min_attr_len})"
@@ -726,9 +737,13 @@ def verify_all(
                                 break
                         if witness_key is None:
                             continue
-                        exp = os.path.basename(os.path.normpath(work_dir))
                         err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
                         err_counts_by_exp[exp]["nonminimal"] += 1
+                        err_counts_by_exp_inst.setdefault(exp, {}).setdefault(
+                            inst,
+                            {"incorrect": 0, "nonminimal": 0},
+                        )
+                        err_counts_by_exp_inst[exp][inst]["nonminimal"] += 1
                         orig_ctrl = Control(dict(orig_key))
                         witness_ctrl = Control(dict(witness_key))
                         witness_min_viol, witness_min_attr = witness_pair  # type: ignore[misc]
@@ -759,7 +774,7 @@ def verify_all(
             for pool in worker_pools:
                 pool.join()
 
-    return err_counts_by_exp
+    return err_counts_by_exp, err_counts_by_exp_inst
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +919,7 @@ if __name__ == "__main__":
         for d in work_dir_list:
             print(f"  {d}")
 
-    err_counts_by_exp = verify_all(
+    err_counts_by_exp, err_counts_by_exp_inst = verify_all(
         work_dir_list,
         output_path,
         args.instances,
@@ -920,6 +935,27 @@ if __name__ == "__main__":
         exp: err_counts_by_exp[exp]
         for exp in sorted(err_counts_by_exp.keys())
     }
+    sorted_counts_by_inst = {
+        exp: {
+            inst: err_counts_by_exp_inst.get(exp, {}).get(
+                inst,
+                {"incorrect": 0, "nonminimal": 0},
+            )
+            for inst in sorted(err_counts_by_exp_inst.get(exp, {}).keys())
+            if any(
+                err_counts_by_exp_inst.get(exp, {}).get(
+                    inst,
+                    {"incorrect": 0, "nonminimal": 0},
+                )[k] > 0
+                for k in ("incorrect", "nonminimal")
+            )
+        }
+        for exp in sorted(err_counts_by_exp_inst.keys())
+        if any(
+            any(counts[k] > 0 for k in ("incorrect", "nonminimal"))
+            for counts in err_counts_by_exp_inst.get(exp, {}).values()
+        )
+    }
     summary_obj = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "root_dir": results_root,
@@ -927,6 +963,7 @@ if __name__ == "__main__":
         "check_subset": args.check_subset,
         "instances": args.instances,
         "experiments": sorted_counts,
+        "experiments_by_instance": sorted_counts_by_inst,
         "summary": {
             "experiments": len(sorted_counts),
             "incorrect_total": sum(v["incorrect"] for v in sorted_counts.values()),

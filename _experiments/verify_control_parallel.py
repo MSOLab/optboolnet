@@ -789,13 +789,22 @@ if __name__ == "__main__":
     )
 
     err_counts_by_exp: Dict[str, Dict[str, int]] = {}
+    err_counts_by_exp_inst: Dict[str, Dict[str, Dict[str, int]]] = {}
     for work_dir in work_dir_list:
         exp = os.path.basename(os.path.normpath(work_dir))
         err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
+        err_counts_by_exp_inst.setdefault(exp, {})
     for work_dir, _, _ in all_incorrect:
         exp = os.path.basename(os.path.normpath(work_dir))
         err_counts_by_exp.setdefault(exp, {"incorrect": 0, "nonminimal": 0})
         err_counts_by_exp[exp]["incorrect"] += 1
+    for work_dir, inst, _ in all_incorrect:
+        exp = os.path.basename(os.path.normpath(work_dir))
+        err_counts_by_exp_inst.setdefault(exp, {}).setdefault(
+            inst,
+            {"incorrect": 0, "nonminimal": 0},
+        )
+        err_counts_by_exp_inst[exp][inst]["incorrect"] += 1
 
     verify_summary_path = (
         args.summary_output
@@ -807,6 +816,27 @@ if __name__ == "__main__":
         exp: err_counts_by_exp[exp]
         for exp in sorted(err_counts_by_exp.keys())
     }
+    sorted_counts_by_inst = {
+        exp: {
+            inst: err_counts_by_exp_inst.get(exp, {}).get(
+                inst,
+                {"incorrect": 0, "nonminimal": 0},
+            )
+            for inst in sorted(err_counts_by_exp_inst.get(exp, {}).keys())
+            if any(
+                err_counts_by_exp_inst.get(exp, {}).get(
+                    inst,
+                    {"incorrect": 0, "nonminimal": 0},
+                )[k] > 0
+                for k in ("incorrect", "nonminimal")
+            )
+        }
+        for exp in sorted(err_counts_by_exp_inst.keys())
+        if any(
+            any(counts[k] > 0 for k in ("incorrect", "nonminimal"))
+            for counts in err_counts_by_exp_inst.get(exp, {}).values()
+        )
+    }
     summary_obj = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "root_dir": results_root,
@@ -814,6 +844,7 @@ if __name__ == "__main__":
         "logic": args.logic,
         "instances": args.instances,
         "experiments": sorted_counts,
+        "experiments_by_instance": sorted_counts_by_inst,
         "summary": {
             "experiments": len(sorted_counts),
             "incorrect_total": sum(v["incorrect"] for v in sorted_counts.values()),
