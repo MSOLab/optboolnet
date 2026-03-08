@@ -532,47 +532,39 @@ def _cut_display_label(col_name: str, col_prefix: str) -> str:
     return _CUT_LABEL_MAP.get(raw, raw)
 
 
-def _cuts_for_ml(
-    spi_ml: pd.DataFrame, cut_cols: list[str], section: str, col_prefix: str
-) -> pd.DataFrame | None:
-    inst_present = [i for i in INST_ORDER if i in spi_ml["inst"].values]
-    rows = []
-    for alg in sorted(spi_ml["alg"].dropna().unique()):
-        spi_alg = spi_ml[spi_ml["alg"] == alg]
-        for col in cut_cols:
-            if col not in spi_alg.columns:
-                continue
-            sub = spi_alg.groupby("inst")[col].mean().reindex(inst_present)
-            if sub.notna().sum() == 0:
-                continue
-            sub.name = (section, alg, _cut_display_label(col, col_prefix))
-            rows.append(sub)
-    if not rows:
-        return None
-    tbl = pd.concat(rows, axis=1).T
-    tbl.index = pd.MultiIndex.from_tuples(tbl.index, names=["Section", "Algorithm", "Cuts"])
-    return tbl
-
-
 def make_cuts_table(spi: pd.DataFrame, variant: str | None, col_prefix: str) -> pd.DataFrame:
     spi = spi.copy()
     if variant:
         spi = spi[spi["experiment"].str.endswith(variant)]
-    spi["alg"] = spi["experiment"].str.split("_").str[0]
 
     cut_cols = _cut_columns(spi, col_prefix)
     if not cut_cols:
         return pd.DataFrame()
-    section = "Total # of cuts" if col_prefix == "count_cuts" else "Avg. literals in a cut"
-    parts: dict[int, pd.DataFrame] = {}
-    for ml in sorted(spi["max_length"].unique()):
-        tbl_ml = _cuts_for_ml(spi[spi["max_length"] == ml], cut_cols, section, col_prefix)
-        if tbl_ml is not None:
-            parts[ml] = tbl_ml
-    if not parts:
+
+    inst_present = [i for i in INST_ORDER if i in spi["inst"].values]
+    melted = spi.melt(
+        id_vars=["max_length", "experiment", "inst"],
+        value_vars=cut_cols,
+        var_name="cut_col",
+        value_name="value",
+    )
+    melted = melted.dropna(subset=["value"])
+    if melted.empty:
         return pd.DataFrame()
-    tbl = pd.concat(parts, axis=1)
-    tbl.columns.names = ["T_max", "inst"]
+
+    melted["Cuts"] = melted["cut_col"].map(lambda c: _cut_display_label(c, col_prefix))
+    tbl = (
+        melted.pivot_table(
+            index=["max_length", "experiment", "Cuts"],
+            columns="inst",
+            values="value",
+            aggfunc="first",
+        )
+        .reindex(columns=inst_present)
+        .sort_index()
+    )
+    tbl.columns.name = None
+    tbl.index = tbl.index.set_names(["max_length", "experiment", "Cuts"])
     return tbl.apply(pd.to_numeric, errors="coerce").round(1)
 
 
