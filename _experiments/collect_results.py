@@ -243,45 +243,54 @@ def collect_minimality_timestamps(contexts: list[ExperimentContext]) -> pd.DataF
     return out[cols]
 
 
-def filter_timeout_rows(
-    df: pd.DataFrame | None,
-    summary_level: pd.DataFrame | None,
-    time_limit: float = 600.0,
-) -> pd.DataFrame | None:
+def collect_finished_timestamps(contexts: list[ExperimentContext]) -> pd.DataFrame:
     """
-    Drop timestamp rows for (experiment, inst, level) combinations that hit the
-    time limit in summary.csv.
-
-    A timed-out row is identified by completion_time >= time_limit together with
-    level_finished == False when that flag is available.
+    Collect FINISHED-step timestamps from solve logs across all experiments.
     """
-    if df is None or df.empty or summary_level is None or summary_level.empty:
-        return df
+    frames: list[pd.DataFrame] = []
+    for ctx in contexts:
+        for log_analysis in ctx.exp.log_list:
+            solve_log = getattr(log_analysis, "solve_log", None)
+            if solve_log is None or solve_log.empty or "step" not in solve_log.columns:
+                continue
 
-    required = {"experiment", "inst", "level", "completion_time"}
-    if not required.issubset(summary_level.columns):
-        return df
+            df = solve_log.loc[
+                solve_log["step"] == "FINISHED",
+                [c for c in ["timestamp", "experiment", "inst", "level"] if c in solve_log.columns],
+            ].copy()
+            if df.empty:
+                continue
 
-    timed_out = summary_level.copy()
-    timed_out["completion_time"] = pd.to_numeric(timed_out["completion_time"], errors="coerce")
-    mask = timed_out["completion_time"] >= float(time_limit)
-    if "level_finished" in timed_out.columns:
-        finished = timed_out["level_finished"]
-        if finished.dtype != bool:
-            finished = finished.astype(str).str.lower().map({"true": True, "false": False})
-        mask &= finished == False
+            df["max_length"] = ctx.config.get("max_length", None)
+            df["max_control_size"] = ctx.config.get("max_control_size", None)
+            frames.append(df)
 
-    timed_out = timed_out.loc[mask, ["experiment", "inst", "level"]].drop_duplicates()
-    if timed_out.empty:
-        return df
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "experiment",
+                "inst",
+                "level",
+                "max_length",
+                "max_control_size",
+            ]
+        )
 
-    out = df.merge(
-        timed_out.assign(_timed_out=True),
-        on=["experiment", "inst", "level"],
-        how="left",
-    )
-    out = out[out["_timed_out"] != True].drop(columns=["_timed_out"])
-    return out
+    out = pd.concat(frames, axis=0, ignore_index=True)
+    cols = [
+        c
+        for c in [
+            "timestamp",
+            "experiment",
+            "inst",
+            "level",
+            "max_length",
+            "max_control_size",
+        ]
+        if c in out.columns
+    ]
+    return out[cols]
 
 
 def add_experiment_parts(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -757,10 +766,6 @@ def write_timestamp_table(
     if df is None or df.empty:
         print("  (no data)")
         return None
-    df = filter_timeout_rows(df, summary_level, time_limit=time_limit)
-    if df is None or df.empty:
-        print("  (no data after timeout filtering)")
-        return None
     df = add_experiment_parts(df)
     keep_cols = [
         c
@@ -778,6 +783,33 @@ def write_timestamp_table(
     ]
     df = df[keep_cols]
     out_path = os.path.join(output_dir, "timestamp.csv")
+    df.to_csv(out_path, index=False)
+    print(f"{len(df):>6} rows  →  {out_path}")
+    return out_path
+
+
+def write_finished_timestamp_table(output_dir: str, df: pd.DataFrame | None) -> str | None:
+    print(f"\n  {'timestamp (FINISHED)':<30}", end="", flush=True)
+    if df is None or df.empty:
+        print("  (no data)")
+        return None
+    df = add_experiment_parts(df)
+    keep_cols = [
+        c
+        for c in [
+            "timestamp",
+            "experiment",
+            "alg_name",
+            "option",
+            "inst",
+            "level",
+            "max_length",
+            "max_control_size",
+        ]
+        if c in df.columns
+    ]
+    df = df[keep_cols]
+    out_path = os.path.join(output_dir, "timestamp_finished.csv")
     df.to_csv(out_path, index=False)
     print(f"{len(df):>6} rows  →  {out_path}")
     return out_path
@@ -906,6 +938,7 @@ def main() -> None:
     metric_dfs = collect_metrics(contexts, args.metrics)
     print(f"Computed metric tables: {', '.join(sorted(metric_dfs.keys())) or '(none)'}")
     timestamp_df = collect_minimality_timestamps(contexts)
+    finished_timestamp_df = collect_finished_timestamps(contexts)
 
     # --- Build and write summary tables -------------------------------------
     written = []
@@ -942,6 +975,9 @@ def main() -> None:
     )
     if timestamp_path:
         written.append(timestamp_path)
+    finished_timestamp_path = write_finished_timestamp_table(output_dir, finished_timestamp_df)
+    if finished_timestamp_path:
+        written.append(finished_timestamp_path)
 
     print(f"\nDone. {len(written)} CSV file(s) written to '{output_dir}'.")
 
