@@ -26,6 +26,7 @@ Usage
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,9 +44,10 @@ _CUT_LABEL_MAP: dict[str, str] = {
     "ATTRACTOR_CUT": "AT cut",
     "TRAP_SPACE_CUT": "TS cut",
     "MINIMALITY": "MIN cut",
-    "NO_GOOD_MASTER": "No-good(master)",
-    "NO_GOOD_LOWER_LEVEL": "No-good(lower)",
+    "NO_GOOD_MASTER": "No-good cut",
+    "NO_GOOD_LOWER_LEVEL": "No-good cut(lower)",
 }
+_EXPERIMENT_RE = re.compile(r"^(?P<alg_name>[^_]+)_(?P<option>[^_]+)_(?P<max_length>\d+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,132 @@ def collect_metrics(
     }
 
 
+def collect_minimality_timestamps(contexts: list[ExperimentContext]) -> pd.DataFrame:
+    """
+    Collect raw timestamp rows for MINIMALITY cuts across all experiments.
+
+    Output columns include experiment/instance identifiers together with the
+    experiment config flags so the rows can be filtered later without having to
+    reopen the original logs.
+    """
+    frames: list[pd.DataFrame] = []
+    for ctx in contexts:
+        for log_analysis in ctx.exp.log_list:
+            cut_log = getattr(log_analysis, "cut_log", None)
+            if cut_log is None or cut_log.empty:
+                continue
+            if "cut_type" not in cut_log.columns:
+                continue
+
+            df = cut_log.loc[
+                cut_log["cut_type"] == "MINIMALITY",
+                [c for c in ["timestamp", "experiment", "inst", "level"] if c in cut_log.columns],
+            ].copy()
+            if df.empty:
+                continue
+
+            df["max_length"] = ctx.config.get("max_length", None)
+            df["max_control_size"] = ctx.config.get("max_control_size", None)
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "experiment",
+                "inst",
+                "level",
+                "max_length",
+                "max_control_size",
+            ]
+        )
+
+    out = pd.concat(frames, axis=0, ignore_index=True)
+    cols = [
+        c
+        for c in [
+            "timestamp",
+            "experiment",
+            "inst",
+            "level",
+            "max_length",
+            "max_control_size",
+        ]
+        if c in out.columns
+    ]
+    return out[cols]
+
+
+def filter_timeout_rows(
+    df: pd.DataFrame | None,
+    summary_level: pd.DataFrame | None,
+    time_limit: float = 600.0,
+) -> pd.DataFrame | None:
+    """
+    Drop timestamp rows for (experiment, inst, level) combinations that hit the
+    time limit in summary.csv.
+
+    A timed-out row is identified by completion_time >= time_limit together with
+    level_finished == False when that flag is available.
+    """
+    if df is None or df.empty or summary_level is None or summary_level.empty:
+        return df
+
+    required = {"experiment", "inst", "level", "completion_time"}
+    if not required.issubset(summary_level.columns):
+        return df
+
+    timed_out = summary_level.copy()
+    timed_out["completion_time"] = pd.to_numeric(timed_out["completion_time"], errors="coerce")
+    mask = timed_out["completion_time"] >= float(time_limit)
+    if "level_finished" in timed_out.columns:
+        finished = timed_out["level_finished"]
+        if finished.dtype != bool:
+            finished = finished.astype(str).str.lower().map({"true": True, "false": False})
+        mask &= finished == False
+
+    timed_out = timed_out.loc[mask, ["experiment", "inst", "level"]].drop_duplicates()
+    if timed_out.empty:
+        return df
+
+    out = df.merge(
+        timed_out.assign(_timed_out=True),
+        on=["experiment", "inst", "level"],
+        how="left",
+    )
+    out = out[out["_timed_out"] != True].drop(columns=["_timed_out"])
+    return out
+
+
+def add_experiment_parts(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """
+    Parse '<alg_name>_<option>_<max_length>' from the experiment column and add
+    the pieces as columns. If max_length already exists, keep the existing one
+    and only add alg_name / option.
+    """
+    if df is None or df.empty or "experiment" not in df.columns:
+        return df
+
+    out = df.copy()
+    parsed = out["experiment"].astype(str).str.extract(_EXPERIMENT_RE)
+    if parsed.empty:
+        return out
+
+    insert_after = out.columns.get_loc("experiment") + 1
+    cols_to_insert: list[tuple[str, pd.Series]] = []
+    if "alg_name" not in out.columns:
+        cols_to_insert.append(("alg_name", parsed["alg_name"]))
+    if "option" not in out.columns:
+        cols_to_insert.append(("option", parsed["option"]))
+    if "max_length" not in out.columns and "max_length" in parsed.columns:
+        cols_to_insert.append(("max_length", pd.to_numeric(parsed["max_length"], errors="coerce")))
+
+    for idx, (col_name, values) in enumerate(cols_to_insert):
+        out.insert(insert_after + idx, col_name, values)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Summary tables (horizontal join across metrics)
 # ---------------------------------------------------------------------------
@@ -316,7 +444,7 @@ def build_summary_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | N
                 result = result.join(mcs, on=_INST_KEY, how="left")
                 break
 
-    return result
+    return add_experiment_parts(result)
 
 
 def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
@@ -425,7 +553,7 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
                 result = result.join(mcs, on=_INST_KEY, how="left")
                 break
 
-    return result
+    return add_experiment_parts(result)
 
 
 # ---------------------------------------------------------------------------
@@ -433,10 +561,11 @@ def build_per_inst_table(metric_dfs: dict[str, pd.DataFrame]) -> pd.DataFrame | 
 # ---------------------------------------------------------------------------
 
 def make_solution_count(df: pd.DataFrame) -> pd.DataFrame:
+    df = add_experiment_parts(df)
     inst_present = [c for c in INST_ORDER if c in df["inst"].values]
     tbl = (
         df.pivot_table(
-            index=["max_length", "experiment"],
+            index=[c for c in ["alg_name", "option", "max_length", "experiment"] if c in df.columns],
             columns="inst",
             values="total_solutions",
             aggfunc="first",
@@ -490,21 +619,24 @@ def make_solution_count_bold(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame
         )
 
     out = base.copy().astype(object)
-    for (_, experiment), row in base.iterrows():
+    exp_level = base.index.names.index("experiment") if "experiment" in base.index.names else None
+    for idx, row in base.iterrows():
+        experiment = idx[exp_level] if exp_level is not None and isinstance(idx, tuple) else idx
         for inst in base.columns:
             val = row[inst]
             if pd.isna(val):
-                out.loc[(_, experiment), inst] = ""
+                out.loc[idx, inst] = ""
             else:
                 cell = str(int(round(val)))
                 if (experiment, inst) in finished_pairs:
                     cell = f"{cell}*"
-                out.loc[(_, experiment), inst] = cell
+                out.loc[idx, inst] = cell
     return out
 
 
 def make_completion_time(ct: pd.DataFrame, variant: str | None) -> pd.DataFrame:
     ct = ct.copy().dropna(subset=["experiment", "inst", "level"])
+    ct = add_experiment_parts(ct)
     if variant:
         ct = ct[ct["experiment"].str.endswith(variant)]
     ct["label"] = ct["experiment"].map(lambda e: LABEL_MAP.get(e, e))
@@ -542,7 +674,7 @@ def _cut_display_label(col_name: str, col_prefix: str) -> str:
 
 
 def make_cuts_table(spi: pd.DataFrame, variant: str | None, col_prefix: str) -> pd.DataFrame:
-    spi = spi.copy()
+    spi = add_experiment_parts(spi.copy())
     if variant:
         spi = spi[spi["experiment"].str.endswith(variant)]
 
@@ -564,7 +696,7 @@ def make_cuts_table(spi: pd.DataFrame, variant: str | None, col_prefix: str) -> 
     melted["Cuts"] = melted["cut_col"].map(lambda c: _cut_display_label(c, col_prefix))
     tbl = (
         melted.pivot_table(
-            index=["max_length", "experiment", "Cuts"],
+            index=[c for c in ["alg_name", "option", "max_length", "experiment", "Cuts"] if c in melted.columns],
             columns="inst",
             values="value",
             aggfunc="first",
@@ -573,7 +705,7 @@ def make_cuts_table(spi: pd.DataFrame, variant: str | None, col_prefix: str) -> 
         .sort_index()
     )
     tbl.columns.name = None
-    tbl.index = tbl.index.set_names(["max_length", "experiment", "Cuts"])
+    tbl.index = tbl.index.set_names([c for c in ["alg_name", "option", "max_length", "experiment", "Cuts"] if c in tbl.index.names])
     return tbl.apply(pd.to_numeric, errors="coerce").round(1)
 
 
@@ -613,6 +745,42 @@ def write_aggregate_tables(
         print(f"{str(tbl.shape):>12}  →  {out_path}")
         written.append(out_path)
     return written
+
+
+def write_timestamp_table(
+    output_dir: str,
+    df: pd.DataFrame | None,
+    summary_level: pd.DataFrame | None = None,
+    time_limit: float = 600.0,
+) -> str | None:
+    print(f"\n  {'timestamp (MINIMALITY)':<30}", end="", flush=True)
+    if df is None or df.empty:
+        print("  (no data)")
+        return None
+    df = filter_timeout_rows(df, summary_level, time_limit=time_limit)
+    if df is None or df.empty:
+        print("  (no data after timeout filtering)")
+        return None
+    df = add_experiment_parts(df)
+    keep_cols = [
+        c
+        for c in [
+            "timestamp",
+            "experiment",
+            "alg_name",
+            "option",
+            "inst",
+            "level",
+            "max_length",
+            "max_control_size",
+        ]
+        if c in df.columns
+    ]
+    df = df[keep_cols]
+    out_path = os.path.join(output_dir, "timestamp.csv")
+    df.to_csv(out_path, index=False)
+    print(f"{len(df):>6} rows  →  {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +905,7 @@ def main() -> None:
     print(f"Computing {len(args.metrics)} metric(s) for summary generation...")
     metric_dfs = collect_metrics(contexts, args.metrics)
     print(f"Computed metric tables: {', '.join(sorted(metric_dfs.keys())) or '(none)'}")
+    timestamp_df = collect_minimality_timestamps(contexts)
 
     # --- Build and write summary tables -------------------------------------
     written = []
@@ -748,6 +917,7 @@ def main() -> None:
         print(f"\n  {label:<30}", end="", flush=True)
         df = builder(metric_dfs)
         if df is not None and not df.empty:
+            df = add_experiment_parts(df)
             out_path = os.path.join(output_dir, fname)
             df.to_csv(out_path, index=False)
             print(f"{len(df):>6} rows  →  {out_path}")
@@ -764,6 +934,14 @@ def main() -> None:
             variant=args.variant,
         )
     )
+
+    timestamp_path = write_timestamp_table(
+        output_dir,
+        timestamp_df,
+        summary_level=summary_outputs.get("summary"),
+    )
+    if timestamp_path:
+        written.append(timestamp_path)
 
     print(f"\nDone. {len(written)} CSV file(s) written to '{output_dir}'.")
 
