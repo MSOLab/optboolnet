@@ -120,7 +120,7 @@ def build_latex(total_df: pd.DataFrame, avg_df: pd.DataFrame, tmax: int) -> str:
         r"\begin{table}[t]",
         r"\small",
         r"\centering",
-        rf"\TABLE{{The statistics of the Benders cuts  $(\Tmax={tmax})$\label{{tab:result-benders-statistics}}}}{{",
+        rf"\TABLE{{The statistics of the Benders cuts  $(\Tmax={tmax})$\label{{tab:result-benders-statistics-tmax-{tmax}}}}}{{",
         rf"\begin{{tabular}}{{{TABULAR_SPEC}}} \toprule",
         r"\newcutstrengthheader \\ \midrule",
         r"\multicolumn{13}{@{}l}{\textit{\textbf{Total \# of cuts}}} \\",
@@ -143,7 +143,7 @@ def main() -> None:
         "-o",
         "--output",
         default=None,
-        help="Output tex path (default: <root_dir>/_results/agg_cut_strength.tex)",
+        help="Output tex path (default: <root_dir>/_results/agg_cut_strength_T<tmax>.tex)",
     )
     parser.add_argument(
         "--tmax",
@@ -194,7 +194,11 @@ def main() -> None:
 
     latex = build_latex(total_df, avg_df, args.tmax)
 
-    output_path = Path(args.output) if args.output else root_dir / "_results" / "agg_cut_strength.tex"
+    output_path = (
+        Path(args.output)
+        if args.output
+        else root_dir / "_results" / f"agg_cut_strength_T{args.tmax}.tex"
+    )
     output_path.write_text(latex + "\n", encoding="utf-8")
     print(output_path)
 
