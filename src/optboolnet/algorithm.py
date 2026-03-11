@@ -1,5 +1,5 @@
 import time
-from typing import Dict, List, Callable, Optional
+from typing import Any, Dict, List, Callable, Optional
 from optboolnet import CNFBooleanNetwork, Control
 from optboolnet.boolnet import Attractor
 from optboolnet.exception import InvalidConfigError
@@ -10,6 +10,7 @@ from optboolnet.model import (
     AttractorDetectionIP,
     ExtendedAttractorDetectionIP,
     AggregatedAttractorDetectionIP,
+    LongestAttractorDetectionIP,
     MasterControlIP,
     TrapSpaceDetectionIP,
 )
@@ -395,3 +396,49 @@ def enumerate_attractors(
             yield attractor
             attractor_list += [attractor]
             attr_ip.add_no_good_x(attractor)
+
+
+class LongestAttractorControl:
+    """Single-level longest-attractor manager (no Benders or bilevel)."""
+
+    def __init__(self, name: str, bn: CNFBooleanNetwork) -> None:
+        self.name = name
+        self.bn = bn
+        self.model: Optional[LongestAttractorDetectionIP] = None
+
+    def solve(
+        self,
+        tmax: int,
+        phenotype_mode: str = "violating",
+        solver_config: SolverConfig = SolverConfig(),
+        max_control_size: Optional[int] = None,
+        use_state_periodicity: bool = False,
+    ) -> Dict[str, Any]:
+        if tmax < 1:
+            raise ValueError(f"tmax must be >= 1, got {tmax}")
+        if max_control_size is not None and max_control_size < 0:
+            raise ValueError(f"max_control_size must be >= 0, got {max_control_size}")
+
+        self.model = LongestAttractorDetectionIP(
+            name=self.name,
+            bn=self.bn,
+            max_length=tmax,
+            solver_setting=solver_config,
+            phenotype_mode=phenotype_mode,
+        )
+        self.model.make_constr_stability_condition()
+        self.model.make_constr_periodicity()
+        self.model.make_constr_state_periodicity(use_state_periodicity)
+        self.model.make_constr_phenotype_and_length()
+        self.model.make_constr_subcycle_prevention()
+        self.model.set_constr_max_control_size(max_control_size)
+        self.model.set_length_objective()
+        self.model.set_phenotype_mode(phenotype_mode)
+
+        self.model.optimize()
+        result = self.model.get_result()
+        result["name"] = self.name
+        result["tmax"] = tmax
+        result["max_control_size"] = max_control_size
+        result["use_state_periodicity"] = use_state_periodicity
+        return result

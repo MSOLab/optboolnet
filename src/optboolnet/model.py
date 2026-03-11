@@ -849,6 +849,188 @@ class AggregatedAttractorDetectionIP(MasterControlIP):
         return Attractor(self.bn, unique_state_seq, x_1, alpha, beta)
 
 
+class LongestAttractorDetectionIP(AggregatedAttractorDetectionIP):
+    """Single-level MILP for jointly selecting control and attractor with maximum length.
+
+    This extends AggregatedAttractorDetectionIP by:
+    - maximizing selected attractor length via w
+    - enforcing anti-subcycle constraints with XOR indicators
+    - supporting phenotype mode: "violating" (p=0) or "none"
+    """
+
+    PHENOTYPE_MODES = {"violating", "none"}
+
+    def __init__(
+        self,
+        name: str,
+        bn: CNFBooleanNetwork,
+        max_length: int,
+        solver_setting: SolverConfig,
+        phenotype_mode: str = "violating",
+        *args,
+        **kwds,
+    ):
+        super().__init__(name, bn, max_length, solver_setting, *args, **kwds)
+        self.phenotype_mode = phenotype_mode
+        self.T_sub_prev = pmoenv.Set(initialize=range(1, max_length))
+        """Indices t in [1..Tmax-1] used for q[t] = sum_{r=t+1..Tmax} w[r]."""
+        self.T_sub = pmoenv.Set(initialize=range(2, 1 + max_length))
+        """Indices t in [2..Tmax] used for no-repetition against state at t=1."""
+
+        self.q = pmoenv.Var(self.T_sub_prev, domain=pmoenv.Binary)
+        """q[t]=1 iff selected attractor length is strictly greater than t."""
+        self.delta = pmoenv.Var(self.I * self.T_sub, domain=pmoenv.Binary)
+        """delta[i,t]=1 iff x[i,t] differs from x[i,1] (XOR linearization)."""
+        self.append_vars_to_solvers([self.q, self.delta])
+
+        self.constrs_subcycle = pmoenv.ConstraintList()
+        """"""
+        self.constrs_max_control_size = pmoenv.ConstraintList()
+        """"""
+        self.constrs_state_periodicity = pmoenv.ConstraintList()
+        """"""
+
+    def make_constr_subcycle_prevention(self):
+        """Prevent repeating the first state before the selected cycle length.
+
+        Strong equivalent chain for q:
+            q[t] - q[t+1] = w[t+1] for t in [1..Tmax-2]
+            q[Tmax-1] = w[Tmax]
+
+        and for time t+1, enforce at least one i differs from state 1 when q[t]=1.
+        Also force delta to zero when q[t]=0.
+        """
+        self.clear_constr_list(self.constrs_subcycle)
+
+        if self.max_length <= 1:
+            return
+
+        for t in range(1, self.max_length - 1):
+            self.add_constr_to_list(
+                self.q[t] - self.q[t + 1] == self.w[t + 1],
+                self.constrs_subcycle,
+            )
+
+        self.add_constr_to_list(
+            self.q[self.max_length - 1] == self.w[self.max_length],
+            self.constrs_subcycle,
+        )
+
+        for t in self.T_sub:
+            t_prev = t - 1
+            for i in self.I:
+                x_it = self.x[i, t]
+                x_i1 = self.x[i, 1]
+                d_it = self.delta[i, t]
+                self.add_constr_to_list(d_it >= x_it - x_i1, self.constrs_subcycle)
+                self.add_constr_to_list(d_it >= x_i1 - x_it, self.constrs_subcycle)
+                self.add_constr_to_list(d_it <= x_it + x_i1, self.constrs_subcycle)
+                self.add_constr_to_list(d_it <= 2 - x_it - x_i1, self.constrs_subcycle)
+
+            self.add_constr_to_list(
+                pmoenv.quicksum(self.delta[i, t] for i in self.I) >= self.q[t_prev],
+                self.constrs_subcycle,
+            )
+
+    def set_length_objective(self):
+        self.set_objective(
+            expr=pmoenv.quicksum(t * self.w[t] for t in self.T_range),
+            _minimize=False,
+        )
+
+    def set_phenotype_mode(self, phenotype_mode: str = "violating"):
+        if phenotype_mode not in self.PHENOTYPE_MODES:
+            raise ValueError(
+                f"Invalid phenotype_mode='{phenotype_mode}'. "
+                f"Expected one of: {sorted(self.PHENOTYPE_MODES)}"
+            )
+        self.phenotype_mode = phenotype_mode
+        if phenotype_mode == "violating":
+            self.fix_var(self.p, 0)
+        else:
+            self.relax_var(self.p)
+
+    def set_constr_max_control_size(self, max_control_size: Optional[int]):
+        self.clear_constr_list(self.constrs_max_control_size)
+        if max_control_size is None:
+            return
+        if max_control_size < 0:
+            raise ValueError(f"max_control_size must be >= 0, got {max_control_size}")
+        self.add_constr_to_list(
+            pmoenv.quicksum(self.d[j, k] for j in self.J for k in self.B)
+            <= max_control_size,
+            self.constrs_max_control_size,
+        )
+
+    def make_constr_state_periodicity(self, enabled: bool = False):
+        """Optional tightening: when w[t]=1, force x[i,1]=x[i,t'] for t' = 1 (mod t).
+
+        For each selected period t and each t' in {1+t, 1+2t, ...} within [1..Tmax]:
+            -(1-w[t]) <= x[i,1] - x[i,t'] <= (1-w[t])
+        """
+        self.clear_constr_list(self.constrs_state_periodicity)
+        if not enabled:
+            return
+
+        for t in self.T_range:
+            for t_prime in range(1 + t, self.max_length + 1, t):
+                for i in self.I:
+                    self.add_constr_to_list(
+                        self.x[i, 1] - self.x[i, t_prime] <= 1 - self.w[t],
+                        self.constrs_state_periodicity,
+                    )
+                    self.add_constr_to_list(
+                        self.x[i, t_prime] - self.x[i, 1] <= 1 - self.w[t],
+                        self.constrs_state_periodicity,
+                    )
+
+    def get_selected_length(self) -> Optional[int]:
+        for t in self.T_range:
+            if self.w[t].value is not None and _is_true(self.w[t]):
+                return int(t)
+        return None
+
+    def get_result(self) -> Dict:
+        def _safe_obj_value():
+            try:
+                return float(pmoenv.value(self.obj.expr))
+            except Exception:
+                return None
+
+        term = (
+            str(self.last_termination_condition)
+            if self.last_termination_condition is not None
+            else None
+        )
+        status = str(self.last_solver_status) if self.last_solver_status is not None else None
+        feasible = self.last_termination_condition in [
+            TerminationCondition.feasible,
+            TerminationCondition.optimal,
+        ]
+        result = {
+            "termination_condition": term,
+            "solver_status": status,
+            "objective_value": _safe_obj_value(),
+            "phenotype_mode": self.phenotype_mode,
+            "selected_length": None,
+            "control": None,
+            "attractor_states": None,
+            "attractor_length": None,
+            "phenotype_indicator_p": None,
+        }
+        if not feasible:
+            return result
+
+        T_star = self.get_selected_length()
+        attr = self.get_attractor() if T_star is not None else None
+        result["selected_length"] = T_star
+        result["control"] = dict(sorted(self.get_control().items()))
+        result["attractor_states"] = attr.to_str_list() if attr is not None else None
+        result["attractor_length"] = attr.get_length() if attr is not None else None
+        result["phenotype_indicator_p"] = _as_binary(self.p)
+        return result
+
+
 class TrapSpaceDetectionIP(MasterControlIP):
     """The Pyomo integer programming model for finding an attractor of a given length under a control."""
 
@@ -974,5 +1156,6 @@ Model = TypeVar(
     AttractorDetectionIP,
     ExtendedAttractorDetectionIP,
     AggregatedAttractorDetectionIP,
+    LongestAttractorDetectionIP,
     TrapSpaceDetectionIP,
 )
