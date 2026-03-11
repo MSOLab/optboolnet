@@ -190,7 +190,7 @@ def build_table_block(df: pd.DataFrame, tmax: int, levels: list[int]) -> str:
     lines = [
         r"\begin{table}[t]",
         r"\centering",
-        rf"\TABLE{{Computation time to find all minimal controls up to size $\TargetSize$ with $\Tmax={tmax}$ (sec.)}}{{",
+        rf"\TABLE{{Computation time to find all minimal controls up to size $\TargetSize$ with $\Tmax={tmax}$ (sec.)\label{{tab:computation-time-tmax-{tmax}}}}}{{",
         r"\small",
         rf"\begin{{tabular}}{{{tabular_spec}}}",
     ]
@@ -272,7 +272,7 @@ def main() -> None:
         "-o",
         "--output",
         default=None,
-        help="Output tex path (default: <root_dir>/_results/agg_comptime.tex)",
+        help="Output tex path (default: <root_dir>/_results/agg_comptime_T<tmax>.tex)",
     )
     parser.add_argument(
         "--tmax",
@@ -318,7 +318,11 @@ def main() -> None:
 
     latex = build_latex(df, selected_levels=args.control_size)
 
-    output_path = Path(args.output) if args.output else root_dir / "_results" / "agg_comptime.tex"
+    output_path = (
+        Path(args.output)
+        if args.output
+        else root_dir / "_results" / f"agg_comptime_T{args.tmax}.tex"
+    )
     output_path.write_text(latex + "\n", encoding="utf-8")
     print(output_path)
 

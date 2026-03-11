@@ -159,6 +159,33 @@ def build_finished_points(
     return points_by_level
 
 
+def build_finished_summary_lines(
+    finished_df: pd.DataFrame | None,
+    inst: str,
+    alg_options: list[tuple[str, str]],
+    finished_level: int,
+    time_limit: float,
+) -> list[str]:
+    if finished_df is None or finished_df.empty:
+        return []
+
+    lines: list[str] = []
+    for alg_name, option in alg_options:
+        sub = finished_df[
+            (finished_df["inst"] == inst)
+            & (finished_df["alg_name"] == alg_name)
+            & (finished_df["option"] == option)
+            & (finished_df["level"] == finished_level)
+        ].copy()
+        sub = sub.dropna(subset=["timestamp"])
+        sub = sub[sub["timestamp"] <= time_limit]
+        if sub.empty:
+            continue
+        tmax = float(sub["timestamp"].max())
+        lines.append(f"{alg_name}-{option}: {tmax:.1f}s")
+    return lines
+
+
 def plot_grid(
     df: pd.DataFrame,
     finished_df: pd.DataFrame | None,
@@ -178,6 +205,13 @@ def plot_grid(
     finished_legend_handles: list[Line2D] = []
     seen_finished_levels: set[int] = set()
     color_map = color_map_for_alg_options(alg_options)
+    finished_marker_map = {
+        level: FINISHED_MARKERS[idx % len(FINISHED_MARKERS)]
+        for idx, level in enumerate(finished_levels or [])
+    }
+    single_finished_level = (
+        int(finished_levels[0]) if finished_levels is not None and len(finished_levels) == 1 else None
+    )
     legend_ax = axes[1, 3]
     legend_ax.axis("off")
 
@@ -220,7 +254,7 @@ def plot_grid(
                     x,
                 )
                 for level, (point_x, point_y) in sorted(points_by_level.items()):
-                    marker = FINISHED_MARKERS[level % len(FINISHED_MARKERS)]
+                    marker = finished_marker_map.get(level, FINISHED_MARKERS[0])
                     ax.scatter(
                         point_x,
                         point_y,
@@ -244,7 +278,7 @@ def plot_grid(
                                 markeredgewidth=0.4,
                                 markersize=8,
                                 alpha=0.6,
-                                label=f"Finished L{level}",
+                                label=rf"Finished $\lambda={level}$",
                             )
                         )
                         seen_finished_levels.add(level)
@@ -276,6 +310,29 @@ def plot_grid(
                 ax.set_ylabel("Cumulative # of solutions", fontsize=AXIS_LABEL_FONTSIZE)
             if row_idx == 2:
                 ax.set_xlabel("Time (s)", fontsize=AXIS_LABEL_FONTSIZE)
+            if single_finished_level is not None:
+                summary_lines = build_finished_summary_lines(
+                    finished_df,
+                    inst,
+                    alg_options,
+                    single_finished_level,
+                    time_limit,
+                )
+                if summary_lines:
+                    ax.text(
+                        0.98,
+                        0.03,
+                        "$\\bf{[Finished]}$\n" + "\n".join(summary_lines),
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="bottom",
+                        multialignment="left",
+                        fontsize=TICK_LABEL_FONTSIZE - 1,
+                        color="#444444",
+                        alpha=0.8,
+                        bbox=dict(facecolor="white", alpha=0.35, edgecolor="none"),
+                        zorder=0,
+                    )
 
     combined_handles = legend_handles + finished_legend_handles
     if combined_handles:
