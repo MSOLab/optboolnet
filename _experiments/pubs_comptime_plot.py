@@ -28,6 +28,7 @@ AXIS_LABEL_FONTSIZE = 15
 TICK_LABEL_FONTSIZE = 13
 LEGEND_FONTSIZE = 14
 LINE_WIDTH = 2.8
+YLABEL_X = -0.24
 
 
 def parse_experiment_name(name: str) -> tuple[str, str, int]:
@@ -308,6 +309,7 @@ def plot_grid(
             ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
             if col_idx == 0:
                 ax.set_ylabel("Cumulative # of solutions", fontsize=AXIS_LABEL_FONTSIZE)
+                ax.yaxis.set_label_coords(YLABEL_X, 0.5)
             if row_idx == 2:
                 ax.set_xlabel("Time (s)", fontsize=AXIS_LABEL_FONTSIZE)
             if single_finished_level is not None:
