@@ -22,6 +22,50 @@ def contains_and(expr) -> bool:
     return False
 
 
+def simplify_cnf(ba, f):
+    """
+    Simplify a CNF formula by detecting suspect literals (variables that
+    appear both positive and negative across clauses) and roundtripping
+    through DNF→CNF. Analogous to ``simplify_dnf`` in ``colomoto.minibn``.
+    """
+    def is_wellformed_cnf(f):
+        pos, neg = set(), set()
+        def is_lit(f):
+            if isinstance(f, ba.Symbol):
+                pos.add(f.obj)
+                return True
+            elif isinstance(f, ba.NOT) and isinstance(f.args[0], ba.Symbol):
+                neg.add(f.args[0].obj)
+                return True
+            return False
+
+        def is_clause(f):
+            if is_lit(f):
+                return True
+            if isinstance(f, ba.OR):
+                for g in f.args:
+                    if not is_lit(g):
+                        return False
+                return True
+            return False
+
+        if f is ba.TRUE or f is ba.FALSE:
+            return True, set()
+        if is_clause(f):
+            return True, pos.intersection(neg)
+        if isinstance(f, ba.AND):
+            for g in f.args:
+                if not is_clause(g):
+                    return False, None
+            return True, pos.intersection(neg)
+        return False, None
+
+    is_cnf, suspects = is_wellformed_cnf(f)
+    if is_cnf and suspects:
+        return ba.cnf(ba.dnf(f))
+    return f
+
+
 class ORClause(boolean.Expression):
     """
 
@@ -63,6 +107,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         Symbol_class=boolean.Symbol,
         allowed_in_name=(".", "_", ":", "-"),
         to_cnf: bool = False,
+        simplify: bool = False,
         **kwargs,
     ):
         super().__init__(data, Symbol_class, allowed_in_name)
@@ -88,21 +133,25 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             self.vars_list
         )
 
+        self.__bn_cnf: Dict[str, boolean.Expression] = dict()
         self.__clause_dict: Dict[str, List[ORClause]] = dict()
-        for var_name, CNF_formula in self.items():
-            CNF_formula = self.ba.cnf(CNF_formula) if to_cnf else CNF_formula
-            if isinstance(CNF_formula, _FALSE):
+        for var_name, formula in self.items():
+            cnf_formula = self.ba.cnf(formula) if to_cnf else formula
+            if simplify:
+                cnf_formula = simplify_cnf(self.ba, cnf_formula)
+            self.__bn_cnf[var_name] = cnf_formula
+            if isinstance(cnf_formula, _FALSE):
                 self.__clause_dict[var_name] = list()
-            elif CNF_formula.isliteral or isinstance(
-                CNF_formula, (boolean.OR, _TRUE)
+            elif cnf_formula.isliteral or isinstance(
+                cnf_formula, (boolean.OR, _TRUE)
             ):  # single clause
                 assert not contains_and(
-                    CNF_formula
-                ), f"{var_name}, {CNF_formula} is not a CNF"
-                self.__clause_dict[var_name] = [ORClause(CNF_formula.literals)]
-            elif isinstance(CNF_formula, boolean.AND):  # multiple clauses
+                    cnf_formula
+                ), f"{var_name}, {cnf_formula} is not a CNF"
+                self.__clause_dict[var_name] = [ORClause(cnf_formula.literals)]
+            elif isinstance(cnf_formula, boolean.AND):  # multiple clauses
                 self.__clause_dict[var_name] = [
-                    ORClause(clause.literals) for clause in CNF_formula.args
+                    ORClause(clause.literals) for clause in cnf_formula.args
                 ]
             else:
                 raise TypeError()
@@ -137,18 +186,24 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             "num_clauses": len(list(self.iter_clauses(keyonly=True))),
         }
 
-    def to_bnet(self, sort: bool = True):
+    def items_cnf(self):
+        return self.__bn_cnf.items()
+
+    def get_cnf(self, var_name: str) -> boolean.Expression:
+        return self.__bn_cnf[var_name]
+
+    def to_bnet(self, sort: bool = False):
         line_list = [
-            f"{var_name}, {self.ba.cnf(self.ba.NOT(transition_formula))}"
-            for var_name, transition_formula in self.items()
+            f"{var_name}, {cnf_formula}"
+            for var_name, cnf_formula in self.__bn_cnf.items()
         ]
         line_list = sorted(line_list) if sort else line_list
         return "\n".join(line_list)
 
     def to_neg_CNF(self, sort: bool = True):
         line_list = [
-            f"{var_name}, {self.ba.cnf(self.ba.NOT(transition_formula))}"
-            for var_name, transition_formula in self.items()
+            f"{var_name}, {self.ba.cnf(self.ba.NOT(cnf_formula))}"
+            for var_name, cnf_formula in self.__bn_cnf.items()
         ]
         line_list = sorted(line_list) if sort else line_list
         return CNFBooleanNetwork("\n".join(line_list), self._control_config)
@@ -159,6 +214,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         inputs: dict = dict(),
         target: dict = dict(),
         exclude: list = list(),
+        simplify: bool = False,
     ):
         new_bn = minibn.BooleanNetwork(bn)
         config = ControlConfig()
@@ -177,7 +233,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
                 cnf_clauses.append(f"!{var}")
         cnf_formula = " & ".join(cnf_clauses)
         new_bn[config.phenotype] = cnf_formula
-        return CNFBooleanNetwork(new_bn, config, to_cnf=True)
+        return CNFBooleanNetwork(new_bn, config, to_cnf=True, simplify=simplify)
 
 
 class Attractor:
