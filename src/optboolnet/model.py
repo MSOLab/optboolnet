@@ -206,7 +206,7 @@ class MasterControlIP(CoreIP):
 
     def set_constr_target_size(self, control_size: int):
         self.clear_constr_list(self.constrs_target_size)
-        if control_size == None:
+        if control_size is None:
             return
         else:
             _sum = pmoenv.summation(self.d)
@@ -304,7 +304,7 @@ class MasterControlIP(CoreIP):
         for j in forbidden_ctrl.unfixed_vars(self.bn.controllable_vars):
             try:
                 terms.append( self.d[j, 1 - forbidden_trap_space[j]])
-            except:
+            except KeyError:
                 pass
 
         expr = pmoenv.quicksum(terms)

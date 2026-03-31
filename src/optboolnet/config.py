@@ -146,7 +146,7 @@ class SolverConfig(Config):
                 self.__dict__.keys()
                 - set(("solver_name", "save_results", "tee", "warmstart"))
             )
-            if self.__getattribute__(_key) != None
+            if self.__getattribute__(_key) is not None
         }
 
     @property

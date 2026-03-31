@@ -56,7 +56,7 @@ class AttractorControl:
 
     @property
     def remaining_time(self) -> Optional[float]:
-        if self.total_time_limit == None:
+        if self.total_time_limit is None:
             return None
         else:
             return self.total_time_limit - self.elapsed_time
@@ -80,13 +80,13 @@ class AttractorControl:
             [
                 tl
                 for tl in [self.remaining_time, problem.solver_config.time_limit]
-                if tl != None
+                if tl is not None
             ],
             default=None,
         )
         # update_options_time_limit
-        if _time_limit != None:
-            if (_time_limit != None) and (_time_limit < 0):
+        if _time_limit is not None:
+            if _time_limit < 0:
                 return False
             else:
                 problem.update_options_time_limit(_time_limit)
