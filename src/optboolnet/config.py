@@ -180,10 +180,10 @@ class MibSBilevelConfig(AttractorControlConfig):
     use_valid_cuts: bool
     solver_config: SolverConfig
 
-    def __init__(self, data: Dict) -> None:
-        super().__init__(data)
+    def __init__(self, **data) -> None:
+        super().__init__(**data)
         assert (
-            self.solver_config.time_limit == None
+            self.solver_config.time_limit is None
         ), "MibS does not allow time limit in SolverConfig"
 
 

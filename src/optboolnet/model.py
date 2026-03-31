@@ -617,7 +617,7 @@ class TrapSpaceDetectionIP(MasterControlIP):
                 self.constrs_stability,
             )
 
-        for i, k in self.I * self.B:
+        for i in self.I:
             d_i = (self.d[i, 0], self.d[i, 1]) if i in self.J else (0, 0)
             for k, clauses in enumerate(
                 [self.neg_bn.items_clause(i), self.bn.items_clause(i)]

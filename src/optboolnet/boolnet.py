@@ -10,7 +10,7 @@ from algorecell_types import PermanentPerturbation
 
 def contains_and(expr) -> bool:
     """
-    Recursively check whether `expr` or any sub‐expression is an AND.
+    Recursively check whether `expr` or any sub-expression is an AND.
     """
     # is this node itself an AND?
     if isinstance(expr, boolean.AND):
@@ -270,11 +270,11 @@ class Hypercube(_Hypercube):
 
 class Control(Hypercube, PermanentPerturbation):
     def __init__(self, *args, **kwargs):
-        super(Hypercube, self).__init__(*args, **kwargs)
-        super(PermanentPerturbation, self).__init__(*args, **kwargs)
+        Hypercube.__init__(self, *args, **kwargs)
+        PermanentPerturbation.__init__(self, *args, **kwargs)
 
     def __hash__(self) -> int:
-        return super(PermanentPerturbation).__hash__()
+        return hash(repr(self))
 
     def unfixed_vars(self, vars_list: List[str]):
         return super().unfixed_vars(vars_list)
