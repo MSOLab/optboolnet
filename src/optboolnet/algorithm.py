@@ -128,7 +128,7 @@ class BendersAttractorControl(AttractorControl):
         self.use_high_point_relaxation: bool = False
         """Use the high point relaxation for the master problem.
         Only valid if the max_length is 1"""
-        self.use_hybrid_encoding: bool = False
+        self.use_hybrid_encoding: bool = True
         """Use hybrid per-gene CNF/DNF encoding for the LLP."""
         self.hybrid_dnf_genes = None
         """If set, force these genes to use DNF encoding (for testing)."""

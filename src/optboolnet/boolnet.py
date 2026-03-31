@@ -167,13 +167,18 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         else:
             raise TypeError()
 
+    @staticmethod
+    def _total_literals(clauses: List[ORClause]) -> int:
+        """Count total literals (with duplicates) across all clauses."""
+        return sum(len(c.args) for c in clauses)
+
     def compute_hybrid_partition(self, dnf_genes: Optional[Set[str]] = None):
         """Compute double CNF and partition genes into CNF/DNF sets.
 
         Args:
             dnf_genes: If provided, force these genes to use DNF encoding.
                 All other genes use CNF. If None, uses the heuristic
-                (gene i in CNF if |C^1_i| <= |C^0_i|).
+                (gene i in CNF if total literals of C^1_i <= total literals of C^0_i).
         """
         self.__neg_clause_dict = {}
         self.__cnf_genes = set()
@@ -190,9 +195,9 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
                 else:
                     self.__cnf_genes.add(var_name)
             else:
-                if len(self.__clause_dict[var_name]) <= len(
-                    self.__neg_clause_dict[var_name]
-                ):
+                pos_lits = self._total_literals(self.__clause_dict[var_name])
+                neg_lits = self._total_literals(self.__neg_clause_dict[var_name])
+                if pos_lits <= neg_lits:
                     self.__cnf_genes.add(var_name)
                 else:
                     self.__dnf_genes.add(var_name)
