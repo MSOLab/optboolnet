@@ -174,6 +174,7 @@ class BendersConfig(AttractorControlConfig):
     preprocess_max_forbidden_trap_space: bool = False
     separation_heuristic: bool = False
     use_high_point_relaxation: bool = False
+    use_hybrid_encoding: bool = False
 
 
 class MibSBilevelConfig(AttractorControlConfig):

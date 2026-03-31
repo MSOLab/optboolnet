@@ -128,6 +128,10 @@ class BendersAttractorControl(AttractorControl):
         self.use_high_point_relaxation: bool = False
         """Use the high point relaxation for the master problem.
         Only valid if the max_length is 1"""
+        self.use_hybrid_encoding: bool = False
+        """Use hybrid per-gene CNF/DNF encoding for the LLP."""
+        self.hybrid_dnf_genes = None
+        """If set, force these genes to use DNF encoding (for testing)."""
 
     def validate_config(self):
         if (self.max_length != 1) and self.use_high_point_relaxation:
@@ -160,6 +164,8 @@ class BendersAttractorControl(AttractorControl):
         for k, v in kwargs.items():
             setattr(self, k, v)
         self.validate_config()
+        if self.use_hybrid_encoding:
+            self.bn.compute_hybrid_partition(dnf_genes=self.hybrid_dnf_genes)
         # model building
         if self.use_high_point_relaxation:
             self.model_master = self._build_model(

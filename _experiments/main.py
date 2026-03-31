@@ -46,6 +46,7 @@ def run_benders(inst: str, exp_name: str, config: BendersConfig) -> None:
     attr_ctrl_manager.use_high_point_relaxation = config.use_high_point_relaxation
     attr_ctrl_manager.total_time_limit = config.total_time_limit
     attr_ctrl_manager.use_aggregated_LLP = config.use_aggregated_LLP
+    attr_ctrl_manager.use_hybrid_encoding = getattr(config, "use_hybrid_encoding", False)
     attr_ctrl_manager.get_control_strategies(
         max_control_size=config.max_control_size,
         max_length=config.max_length,

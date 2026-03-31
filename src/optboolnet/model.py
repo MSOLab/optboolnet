@@ -350,11 +350,15 @@ class AttractorDetectionIP(MasterControlIP):
 
         self.x = pmoenv.Var(self.I * self.T_range, domain=pmoenv.Binary)
         """x[i,t] denotes the value of variable i at position t for all i in I,  t in [T]"""
-        self.y = pmoenv.Var(self.C * self.T_range, domain=pmoenv.Binary)
-        """y[i,c,t] denotes the value of c-th clause of variable i at position t for all i in I, k in [0,1], t in [T]"""
         self.p = pmoenv.ScalarVar(domain=pmoenv.Binary)
         """p = 1 iff the desired property is satisfied"""
-        self.append_vars_to_solvers([self.x, self.y, self.p])
+
+        if bn.is_hybrid_enabled:
+            self._init_hybrid_sets_and_vars()
+        else:
+            self.y = pmoenv.Var(self.C * self.T_range, domain=pmoenv.Binary)
+            """y[i,c,t] denotes the value of c-th clause of variable i at position t"""
+            self.append_vars_to_solvers([self.x, self.y, self.p])
 
         ### ======== constraints
 
@@ -371,6 +375,40 @@ class AttractorDetectionIP(MasterControlIP):
             return self.length
         else:
             return t - 1
+
+    def _init_hybrid_sets_and_vars(self):
+        """Create index sets and variables for hybrid CNF/DNF encoding."""
+
+        # Partition sets
+        self.I_cnf = pmoenv.Set(initialize=self.bn.cnf_genes)
+        self.I_dnf = pmoenv.Set(initialize=self.bn.dnf_genes)
+
+        # Neg clause index set (for DNF genes, using C^0_i)
+        self.C0_i = pmoenv.Set(
+            self.I, initialize=self.bn.get_neg_clause_idx_dict()
+        )
+
+        # CNF clauses: C^1_wedge = union of (i, c) for CNF genes
+        def C_cnf_init(model):
+            return (
+                (i, c) for i in model.I_cnf for c in model.C_i[i]
+            )
+
+        # DNF clauses: C^1_vee = union of (i, c) for DNF genes (neg clauses)
+        def C_dnf_init(model):
+            return (
+                (i, c) for i in model.I_dnf for c in model.C0_i[i]
+            )
+
+        self.C_cnf = pmoenv.Set(dimen=2, initialize=C_cnf_init)
+        self.C_dnf = pmoenv.Set(dimen=2, initialize=C_dnf_init)
+
+        # y for CNF genes, z for DNF genes
+        self.y = pmoenv.Var(self.C_cnf * self.T_range, domain=pmoenv.Binary)
+        """y[i,c,t]: truth value of clause c of CNF gene i at time t"""
+        self.z = pmoenv.Var(self.C_dnf * self.T_range, domain=pmoenv.Binary)
+        """z[i,c,t]: truth value of negated clause c of DNF gene i at time t"""
+        self.append_vars_to_solvers([self.x, self.y, self.z, self.p])
 
     def make_constr_phenotype_at_all_t(self):
         """The phenotype indicates 1 iff the phenotype is satisfied at all states"""
@@ -391,9 +429,18 @@ class AttractorDetectionIP(MasterControlIP):
 
     def make_constr_stability_condition(self):
         """A variable must be fixed if the control is active.
-        Otherwise, transition formulas must be satisfied
+        Otherwise, transition formulas must be satisfied.
+        Supports hybrid CNF/DNF encoding when enabled.
         """
         self.clear_constr_list(self.constrs_stability)
+
+        if self.bn.is_hybrid_enabled:
+            self._make_constr_stability_hybrid()
+        else:
+            self._make_constr_stability_pure_cnf()
+
+    def _make_constr_stability_pure_cnf(self):
+        """Pure CNF stability constraints (original implementation)."""
         for j, t in self.J * self.T_range:
             self.add_constr_to_list(
                 self.d[j, 1] <= self.x[j, t],
@@ -436,6 +483,101 @@ class AttractorDetectionIP(MasterControlIP):
                     self.constrs_stability,
                 )
 
+    def _make_constr_stability_hybrid(self):
+        """Hybrid CNF/DNF stability constraints."""
+        # Block 1: Control enforcement (shared for all genes)
+        for j, t in self.J * self.T_range:
+            self.add_constr_to_list(
+                self.d[j, 1] <= self.x[j, t],
+                self.constrs_stability,
+            )
+            self.add_constr_to_list(
+                self.d[j, 0] <= 1 - self.x[j, t],
+                self.constrs_stability,
+            )
+
+        # Block 2: Transition linking
+        for i in self.I:
+            (d_0, d_1) = (self.d[i, 0], self.d[i, 1]) if i in self.J else (0, 0)
+            if self.bn.is_cnf_gene(i):
+                # CNF gene: x[i,t] <-> AND_c y[i,c,prev(t)]
+                for t in self.T_range:
+                    x_i_t = self.x[i, t]
+                    for c in self.C_i[i]:
+                        self.add_constr_to_list(
+                            x_i_t <= self.y[i, c, self.prev(t)] + (d_0 + d_1),
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        x_i_t
+                        >= (1 - len(self.C_i[i]))
+                        + sum(self.y[i, c, self.prev(t)] for c in self.C_i[i])
+                        - (d_0 + d_1),
+                        self.constrs_stability,
+                    )
+            else:
+                # DNF gene: x[i,t] <-> OR_c z[i,c,prev(t)]
+                for t in self.T_range:
+                    x_i_t = self.x[i, t]
+                    for c in self.C0_i[i]:
+                        self.add_constr_to_list(
+                            x_i_t >= self.z[i, c, self.prev(t)] - (d_0 + d_1),
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        x_i_t
+                        <= pmoenv.quicksum(
+                            self.z[i, c, self.prev(t)] for c in self.C0_i[i]
+                        )
+                        + (d_0 + d_1),
+                        self.constrs_stability,
+                    )
+
+        # Block 3a: Clause definition for CNF genes (y variables)
+        for i in self.I_cnf:
+            for c_idx, clause in enumerate(self.bn.items_clause(i)):
+                for t in self.T_range:
+                    x_lit_list = [
+                        self.x[i_, t] for i_ in clause.pos_literals
+                    ] + [1 - self.x[i_, t] for i_ in clause.neg_literals]
+
+                    for x_lit in x_lit_list:
+                        self.add_constr_to_list(
+                            self.y[i, c_idx, t] >= x_lit,
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        self.y[i, c_idx, t] <= sum(x_lit_list),
+                        self.constrs_stability,
+                    )
+
+        # Block 3b: Term definition for DNF genes (z variables, swapped polarity)
+        for i in self.I_dnf:
+            for c_idx, clause in enumerate(self.bn.items_neg_clause(i)):
+                for t in self.T_range:
+                    # z[i,c,t] = negation of clause c from CNF(neg f_i)
+                    # Upper bounds: z <= 1 - x[l] for pos, z <= x[l] for neg
+                    for i_ in clause.pos_literals:
+                        self.add_constr_to_list(
+                            self.z[i, c_idx, t] <= 1 - self.x[i_, t],
+                            self.constrs_stability,
+                        )
+                    for i_ in clause.neg_literals:
+                        self.add_constr_to_list(
+                            self.z[i, c_idx, t] <= self.x[i_, t],
+                            self.constrs_stability,
+                        )
+                    # Lower bound
+                    self.add_constr_to_list(
+                        self.z[i, c_idx, t]
+                        >= 1
+                        - sum(self.x[i_, t] for i_ in clause.pos_literals)
+                        - sum(
+                            1 - self.x[i_, t] for i_ in clause.neg_literals
+                        ),
+                        self.constrs_stability,
+                    )
+
     def set_phenotype_obj(self, _minimize: bool = True):
         self.set_objective(expr=self.p, _minimize=_minimize)
 
@@ -469,14 +611,29 @@ class AttractorDetectionIP(MasterControlIP):
             all(self.x[j, 1].value == self.x[j, t].value for t in self.T_range)
             for j in self.J
         ]
-        beta = [
-            all(
-                (self.x[j, t].value == 1)
-                == all(self.y[j, c, self.prev(t)].value == 1 for c in self.C_i[j])
-                for t in self.T_range
-            )
-            for j in self.J
-        ]
+        beta = []
+        for j in self.J:
+            if self.bn.is_hybrid_enabled and self.bn.is_dnf_gene(j):
+                # DNF gene: beta = all_t( x[j,t]==1 iff any_c z[j,c,prev(t)]==1 )
+                beta_j = all(
+                    (self.x[j, t].value == 1)
+                    == any(
+                        self.z[j, c, self.prev(t)].value == 1
+                        for c in self.C0_i[j]
+                    )
+                    for t in self.T_range
+                )
+            else:
+                # CNF gene (or pure CNF mode): beta = all_t( x[j,t]==1 iff all_c y[j,c,prev(t)]==1 )
+                beta_j = all(
+                    (self.x[j, t].value == 1)
+                    == all(
+                        self.y[j, c, self.prev(t)].value == 1
+                        for c in self.C_i[j]
+                    )
+                    for t in self.T_range
+                )
+            beta.append(beta_j)
 
         return Attractor(self.bn, unique_state_seq, x_1, alpha, beta)
 
@@ -507,9 +664,18 @@ class ExtendedAttractorDetectionIP(AttractorDetectionIP):
 
     def make_constr_stability_condition(self):
         """A variable must be fixed if the control is active.
-        Otherwise, transition formulas must be satisfied
+        Otherwise, transition formulas must be satisfied.
+        Supports hybrid CNF/DNF encoding when enabled.
         """
         self.clear_constr_list(self.constrs_stability)
+
+        if self.bn.is_hybrid_enabled:
+            self._make_constr_stability_ext_hybrid()
+        else:
+            self._make_constr_stability_ext_pure_cnf()
+
+    def _make_constr_stability_ext_pure_cnf(self):
+        """Extended pure CNF stability constraints with v-slack."""
         for j, t in self.J * self.T_range:
             self.add_constr_to_list(
                 self.d[j, 1] <= self.x[j, t],
@@ -557,6 +723,105 @@ class ExtendedAttractorDetectionIP(AttractorDetectionIP):
                     self.y[i, c, t] <= sum(x_lit_list),
                     self.constrs_stability,
                 )
+
+    def _make_constr_stability_ext_hybrid(self):
+        """Extended hybrid CNF/DNF stability constraints with v-slack."""
+        # Block 1: Control enforcement (shared)
+        for j, t in self.J * self.T_range:
+            self.add_constr_to_list(
+                self.d[j, 1] <= self.x[j, t],
+                self.constrs_stability,
+            )
+            self.add_constr_to_list(
+                -self.v + self.d[j, 0] <= 1 - self.x[j, t],
+                self.constrs_stability,
+            )
+
+        # Block 2: Transition linking
+        for i in self.I:
+            (d_0, d_1) = (self.d[i, 0], self.d[i, 1]) if i in self.J else (0, 0)
+            if self.bn.is_cnf_gene(i):
+                # CNF gene: x[i,t] <-> AND_c y[i,c,prev(t)]
+                for t in self.T_range:
+                    x_i_t = self.x[i, t]
+                    for c in self.C_i[i]:
+                        self.add_constr_to_list(
+                            x_i_t <= self.y[i, c, self.prev(t)] + (d_0 + d_1),
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        x_i_t
+                        >= (1 - len(self.C_i[i]))
+                        + sum(self.y[i, c, self.prev(t)] for c in self.C_i[i])
+                        - (d_0 + d_1),
+                        self.constrs_stability,
+                    )
+            else:
+                # DNF gene: x[i,t] <-> OR_c z[i,c,prev(t)]
+                for t in self.T_range:
+                    x_i_t = self.x[i, t]
+                    for c in self.C0_i[i]:
+                        self.add_constr_to_list(
+                            x_i_t >= self.z[i, c, self.prev(t)] - (d_0 + d_1),
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        x_i_t
+                        <= pmoenv.quicksum(
+                            self.z[i, c, self.prev(t)] for c in self.C0_i[i]
+                        )
+                        + (d_0 + d_1),
+                        self.constrs_stability,
+                    )
+
+        # Block 3a: Clause definition for CNF genes (y, with v-slack on neg literals)
+        for i in self.I_cnf:
+            for c_idx, clause in enumerate(self.bn.items_clause(i)):
+                for t in self.T_range:
+                    x_lit_list = [
+                        self.x[i_, t] for i_ in clause.pos_literals
+                    ] + [1 - self.x[i_, t] for i_ in clause.neg_literals]
+
+                    for i_ in clause.pos_literals:
+                        self.add_constr_to_list(
+                            self.y[i, c_idx, t] >= self.x[i_, t],
+                            self.constrs_stability,
+                        )
+                    for i_ in clause.neg_literals:
+                        self.add_constr_to_list(
+                            self.y[i, c_idx, t]
+                            >= 1 - self.x[i_, t] - self.v,
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        self.y[i, c_idx, t] <= sum(x_lit_list),
+                        self.constrs_stability,
+                    )
+
+        # Block 3b: Term definition for DNF genes (z, swapped polarity, v-slack on lower bound)
+        for i in self.I_dnf:
+            for c_idx, clause in enumerate(self.bn.items_neg_clause(i)):
+                for t in self.T_range:
+                    for i_ in clause.pos_literals:
+                        self.add_constr_to_list(
+                            self.z[i, c_idx, t] <= 1 - self.x[i_, t],
+                            self.constrs_stability,
+                        )
+                    for i_ in clause.neg_literals:
+                        self.add_constr_to_list(
+                            self.z[i, c_idx, t] <= self.x[i_, t],
+                            self.constrs_stability,
+                        )
+                    self.add_constr_to_list(
+                        self.z[i, c_idx, t]
+                        >= 1
+                        - sum(self.x[i_, t] for i_ in clause.pos_literals)
+                        - sum(
+                            1 - self.x[i_, t] for i_ in clause.neg_literals
+                        )
+                        - self.v,
+                        self.constrs_stability,
+                    )
 
     def set_phenotype_obj(self, _minimize: bool = True):
         self.set_objective(expr=self.p + 2 * self.v, _minimize=_minimize)

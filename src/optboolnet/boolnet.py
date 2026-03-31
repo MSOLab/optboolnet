@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import boolean
 from colomoto.minibn import _TRUE, _FALSE
 from colomoto import minibn
@@ -140,21 +140,89 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
             if simplify:
                 cnf_formula = simplify_cnf(self.ba, cnf_formula)
             self.__bn_cnf[var_name] = cnf_formula
-            if isinstance(cnf_formula, _FALSE):
-                self.__clause_dict[var_name] = list()
-            elif cnf_formula.isliteral or isinstance(
-                cnf_formula, (boolean.OR, _TRUE)
-            ):  # single clause
-                assert not contains_and(
-                    cnf_formula
-                ), f"{var_name}, {cnf_formula} is not a CNF"
-                self.__clause_dict[var_name] = [ORClause(cnf_formula.literals)]
-            elif isinstance(cnf_formula, boolean.AND):  # multiple clauses
-                self.__clause_dict[var_name] = [
-                    ORClause(clause.literals) for clause in cnf_formula.args
-                ]
+            self.__clause_dict[var_name] = self._parse_cnf_to_clauses(
+                cnf_formula, var_name
+            )
+
+        # Hybrid encoding state (populated by compute_hybrid_partition)
+        self.__neg_clause_dict: Optional[Dict[str, List[ORClause]]] = None
+        self.__cnf_genes: Optional[Set[str]] = None
+        self.__dnf_genes: Optional[Set[str]] = None
+
+    @staticmethod
+    def _parse_cnf_to_clauses(
+        cnf_formula: boolean.Expression, var_name: str
+    ) -> List[ORClause]:
+        if isinstance(cnf_formula, _FALSE):
+            return list()
+        elif cnf_formula.isliteral or isinstance(
+            cnf_formula, (boolean.OR, _TRUE)
+        ):  # single clause
+            assert not contains_and(
+                cnf_formula
+            ), f"{var_name}, {cnf_formula} is not a CNF"
+            return [ORClause(cnf_formula.literals)]
+        elif isinstance(cnf_formula, boolean.AND):  # multiple clauses
+            return [ORClause(clause.literals) for clause in cnf_formula.args]
+        else:
+            raise TypeError()
+
+    def compute_hybrid_partition(self, dnf_genes: Optional[Set[str]] = None):
+        """Compute double CNF and partition genes into CNF/DNF sets.
+
+        Args:
+            dnf_genes: If provided, force these genes to use DNF encoding.
+                All other genes use CNF. If None, uses the heuristic
+                (gene i in CNF if |C^1_i| <= |C^0_i|).
+        """
+        self.__neg_clause_dict = {}
+        self.__cnf_genes = set()
+        self.__dnf_genes = set()
+        for var_name, formula in self.__bn_cnf.items():
+            neg_cnf = self.ba.cnf(self.ba.NOT(formula))
+            neg_cnf = simplify_cnf(self.ba, neg_cnf)
+            self.__neg_clause_dict[var_name] = self._parse_cnf_to_clauses(
+                neg_cnf, var_name
+            )
+            if dnf_genes is not None:
+                if var_name in dnf_genes:
+                    self.__dnf_genes.add(var_name)
+                else:
+                    self.__cnf_genes.add(var_name)
             else:
-                raise TypeError()
+                if len(self.__clause_dict[var_name]) <= len(
+                    self.__neg_clause_dict[var_name]
+                ):
+                    self.__cnf_genes.add(var_name)
+                else:
+                    self.__dnf_genes.add(var_name)
+
+    @property
+    def is_hybrid_enabled(self) -> bool:
+        return self.__cnf_genes is not None
+
+    def is_cnf_gene(self, gene: str) -> bool:
+        return gene in self.__cnf_genes
+
+    def is_dnf_gene(self, gene: str) -> bool:
+        return gene in self.__dnf_genes
+
+    @property
+    def cnf_genes(self) -> List[str]:
+        return [v for v in self.keys() if v in self.__cnf_genes]
+
+    @property
+    def dnf_genes(self) -> List[str]:
+        return [v for v in self.keys() if v in self.__dnf_genes]
+
+    def items_neg_clause(self, var_name: str) -> List[ORClause]:
+        return self.__neg_clause_dict[var_name]
+
+    def get_neg_clause_idx_dict(self) -> Dict[str, List[int]]:
+        return {
+            i: [idx for idx, _ in enumerate(self.__neg_clause_dict[i])]
+            for i in self.keys()
+        }
 
     def items(self) -> Tuple[str, boolean.Expression]:
         return super().items()
