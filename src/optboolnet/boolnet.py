@@ -66,6 +66,24 @@ def simplify_cnf(ba, f):
     return f
 
 
+def robust_negate_to_cnf(ba, formula):
+    """Compute CNF(¬formula), handling constants and boolean.py crashes."""
+    if isinstance(formula, _TRUE) or formula is ba.TRUE:
+        return ba.FALSE
+    if isinstance(formula, _FALSE) or formula is ba.FALSE:
+        return ba.TRUE
+    try:
+        return ba.cnf(ba.NOT(formula))
+    except (TypeError, AttributeError):
+        neg = ba.NOT(formula).simplify()
+        if neg is None:
+            return ba.FALSE
+        try:
+            return ba.cnf(neg)
+        except (TypeError, AttributeError):
+            return ba.cnf(ba.dnf(neg))
+
+
 class ORClause(boolean.Expression):
     """
 
@@ -184,7 +202,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
         self.__cnf_genes = set()
         self.__dnf_genes = set()
         for var_name, formula in self.__bn_cnf.items():
-            neg_cnf = self.ba.cnf(self.ba.NOT(formula))
+            neg_cnf = robust_negate_to_cnf(self.ba, formula)
             neg_cnf = simplify_cnf(self.ba, neg_cnf)
             self.__neg_clause_dict[var_name] = self._parse_cnf_to_clauses(
                 neg_cnf, var_name
@@ -275,7 +293,7 @@ class CNFBooleanNetwork(minibn.BooleanNetwork):
 
     def to_neg_CNF(self, sort: bool = True):
         line_list = [
-            f"{var_name}, {self.ba.cnf(self.ba.NOT(cnf_formula))}"
+            f"{var_name}, {robust_negate_to_cnf(self.ba, cnf_formula)}"
             for var_name, cnf_formula in self.__bn_cnf.items()
         ]
         line_list = sorted(line_list) if sort else line_list
